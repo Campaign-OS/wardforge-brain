@@ -76,8 +76,10 @@ The brain authenticates users via Google Workspace. Set up an OAuth client.
 8. Application type: Web application.
 9. Name: `WardForge Brain Worker`.
 10. Authorized redirect URIs:
-    - `https://brain-api.ward-forge.com/auth/callback`
-    - `http://127.0.0.1:8787/auth/callback` (for local dev)
+    - `https://brain-api.ward-forge.com/session/callback`
+    - `http://127.0.0.1:8787/session/callback` (for local dev)
+
+    Note the path is `/session/callback`, not `/auth/callback`. See "Cloudflare path-block gotcha" near the end of this doc for why.
 11. Create. Copy the Client ID and Client Secret — you'll paste these into Wrangler secrets.
 
 ## Phase 4 — Deploy the Worker (20 min)
@@ -104,8 +106,15 @@ npx wrangler secret put ANTHROPIC_API_KEY
 # paste your key
 
 npx wrangler secret put GITHUB_TOKEN
-# paste a fine-scoped PAT with repo:read on Campaign-OS/ridingpulse
-# (create at github.com/settings/tokens?type=beta — restrict to org and repo)
+# Fine-grained PAT scoped to the substrate repo (Campaign-OS/wardforge-web).
+# Resource owner MUST be Campaign-OS (the org), not your personal account —
+# fine-grained PATs only access resources owned by their declared owner.
+# Permissions needed: Contents: Read and write (write for inbox commits),
+# Metadata: Read, Pull requests: Read.
+# If Campaign-OS requires PAT approval (org policy), an org owner must approve
+# the request at github.com/organizations/Campaign-OS/settings/personal-access-tokens-pending-requests
+# before the token can access org repos. As an interim workaround, a classic
+# PAT with `repo` scope + SSO authorization works without approval.
 
 npx wrangler secret put GOOGLE_CLIENT_ID
 # paste the OAuth client ID from Phase 3
@@ -205,15 +214,22 @@ Total: $10-40/month. Scales with usage, not user count.
 
 ## Troubleshooting
 
+**Browser GET to `/session/me` returns 403 with `Server: cloudflare`**
+- The block is at Cloudflare's edge, not the worker. Confirm with `wrangler tail` — if only OPTIONS appears, the GET is being dropped by an edge protection. Check the response body: bare "403 Forbidden / cloudflare" = generic edge block; "Just a moment..." = JS challenge; "Access denied / Ray ID + error code" = WAF managed rule.
+- See "Cloudflare path-block gotcha" above for the `/auth/*` story. If you've added a new auth-adjacent route under a different name and it's blocking, the same fix applies: pick a different path namespace.
+
 **"unauthorized" on every API call**
-- Cookie not set — check the redirect URI in Google Cloud Console matches exactly.
+- Cookie not set — check the redirect URI in Google Cloud Console matches `/session/callback` (not `/auth/callback`).
 - SameSite issue — make sure both `brain.ward-forge.com` and `brain-api.ward-forge.com` are HTTPS (Cloudflare handles this automatically).
 
 **Sign-in works but redirects to error**
 - The `hd` parameter is set to `ward-forge.com`. If you sign in with a non-Workspace account, you'll get "Access restricted." Sign in with your Workspace account.
 
-**Brain returns "github fetchFile: 404"**
-- Either the file path doesn't exist in the repo, or the GITHUB_TOKEN doesn't have access. Check the token's repo scope.
+**OAuth callback returns "token exchange failed: invalid_client"**
+- `GOOGLE_CLIENT_SECRET` on the worker doesn't match what Google has on file. Most common causes: secret was never set, was set with a typo / trailing whitespace, or was rotated in Google Console without being pushed to the worker. Re-run `npx wrangler secret put GOOGLE_CLIENT_SECRET` with the current value from Google Cloud Console → Credentials → your OAuth client → Client secrets.
+
+**Brain returns "github fetchFile: 404" or "the substrate is empty"**
+- Either the file path doesn't exist in the repo, or `GITHUB_TOKEN` doesn't have access. If using a fine-grained PAT, confirm the resource owner is `Campaign-OS` (not your personal account) and the org has approved the token. Check `troyc9977` on the token page — if it says "Access on troyc9977", the token is personal-scoped and can't see org repos. Generate a new one with `Resource owner: Campaign-OS`.
 
 **Brain returns "anthropic api 401"**
 - ANTHROPIC_API_KEY is wrong. Re-set with `npx wrangler secret put ANTHROPIC_API_KEY`.
@@ -222,10 +238,13 @@ Total: $10-40/month. Scales with usage, not user count.
 - Rate-limited. Wait a minute or check Anthropic console for usage tier.
 
 **Inbox commit fails**
-- GITHUB_TOKEN needs `contents: write` on the repo, not just read. Update the PAT scopes.
+- GITHUB_TOKEN needs `Contents: Read and write` on the substrate repo, not just read. Update PAT permissions.
 
 **Worker deploy fails with "no KV namespace"**
 - The KV id in wrangler.toml is still the placeholder. Run the create command and paste the real id.
+
+**`brain.ward-forge.com` shows old bundle after deploy**
+- Pages deployed to preview, not production. Verify `wrangler pages deploy` ran with `--branch=main`. Then bust browser cache: DevTools → Application → Storage → Clear site data, close tab, reopen.
 
 ## Layer 2 verification
 
@@ -246,6 +265,73 @@ The pattern in `actions.ts` is propose-then-confirm. To add a new action type (e
 5. Add a UI button in `App.tsx` that triggers the propose flow and shows the draft in the modal.
 
 Total new-action cost: ~30-60 minutes per type. Keep proposals reversible (file additions, draft PRs) before any non-reversible actions.
+
+## Operational notes & Cloudflare path-block gotcha
+
+The auth routes are `/session/*` (not `/auth/*`) for a non-obvious reason. Documenting it here so future-you doesn't try to "clean up" the naming.
+
+**The story.** During first deployment, every browser GET to `/auth/me` returned 403 with `Server: cloudflare` and an HTML body — the request was being rejected at Cloudflare's edge before reaching the worker. Tail logs confirmed only the OPTIONS preflight reached the worker; the GET was dropped silently (no Security Events entries). PowerShell calls with the same headers passed through fine and got 401 from the worker as expected. Same headers, same URL, different outcome based on whether the client looked like a browser.
+
+**What we ruled out, in order**: Bot Fight Mode (off), Browser Integrity Check (off), Cloudflare Access (no app configured), edge-cached 403 (purge cache + Dev Mode didn't help), CORS (preflight succeeded), worker route binding (PowerShell got through), TLS fingerprint (no — even after the fix, browser-shaped PowerShell still passed). Then we tested other paths: `/healthz` worked from browser, `/auth/whatever` 403'd from browser. The block was specifically `/auth/*`, browser-keyed, silent.
+
+**Best theory**: a Cloudflare Free-tier credential-stuffing heuristic that auto-blocks `/auth/*` paths for browser-class clients. It's not in the documented WAF managed rules, doesn't appear in Security Events, and "Skip all managed rules" via WAF custom rule did not fully unblock it.
+
+**The fix**: rename routes from `/auth/*` to `/session/*`. Five-minute change in `worker/src/index.ts`, `worker/src/auth.ts`, `frontend/src/api.ts`, plus the OAuth redirect URI in Google Cloud Console. The block evaporated because there's no protection on `/session/*`.
+
+**The WAF custom rule we left in place** (Security → WAF → Custom rules → "Skip managed rules for API"): hostname equals `brain-api.ward-forge.com`, action Skip, all managed rules + Super Bot Fight Mode + Browser Integrity Check + a few others. It didn't fix the `/auth/*` block by itself but it's the right belt-and-suspenders config for an API hostname — managed rules are designed for user-facing web traffic, not JSON APIs called by your own frontend. Leave it.
+
+**Practical implication**: be careful what paths you name. Anything that looks like an authentication endpoint (`/login`, `/signin`, `/oauth`, `/auth/*`) may trigger the same heuristic. If you're adding a new auth-adjacent route, prefer `/session/*` namespace or test explicitly with a browser before assuming Cloudflare won't intercept.
+
+## One-command deploy
+
+The repo isn't wired to Pages auto-deploy (the project was originally created as Direct Upload). Use this script instead — pushes to GitHub, deploys worker, builds frontend, deploys to production. ~30 seconds total.
+
+Save as `deploy.ps1` at the repo root:
+
+```powershell
+$ErrorActionPreference = "Stop"
+$root = $PSScriptRoot
+
+Write-Host "→ Committing & pushing to GitHub" -ForegroundColor Cyan
+Set-Location $root
+git add -A
+git commit -m "deploy" --allow-empty | Out-Null
+git push
+
+Write-Host "→ Deploying worker" -ForegroundColor Cyan
+Set-Location "$root\worker"
+npx wrangler deploy
+
+Write-Host "→ Building & deploying frontend" -ForegroundColor Cyan
+Set-Location "$root\frontend"
+npm run build
+npx wrangler pages deploy dist --project-name=wardforge-brain-ui --branch=main
+
+Set-Location $root
+Write-Host "✓ Done" -ForegroundColor Green
+```
+
+Run with `.\deploy.ps1` from the repo root. The `--branch=main` flag is critical — without it Pages deploys to a preview URL, not production at `brain.ward-forge.com`.
+
+## Worker secrets reference
+
+Five secrets must be set on the worker. Verify with `npx wrangler secret list` from `worker/`:
+
+| Secret                  | What it is                                                                           |
+|-------------------------|--------------------------------------------------------------------------------------|
+| `ANTHROPIC_API_KEY`     | Anthropic API key for the brain's Claude calls.                                      |
+| `GITHUB_TOKEN`          | Fine-grained PAT, owner = `Campaign-OS`, contents read/write on the substrate repo.  |
+| `GOOGLE_CLIENT_ID`      | OAuth 2.0 Client ID from Google Cloud Console → Credentials.                         |
+| `GOOGLE_CLIENT_SECRET`  | OAuth 2.0 Client Secret. **Never commit, never paste in screenshots, rotate if leaked.** |
+| `SESSION_SECRET`        | Random 32-byte hex string for HMAC-signing session cookies.                          |
+
+Plus three plain vars in `wrangler.toml` `[vars]`: `GITHUB_REPO`, `ALLOWED_DOMAIN`, `FRONTEND_ORIGIN`.
+
+The frontend has one build-time env var, set in Cloudflare Pages → wardforge-brain-ui → Settings → Variables and Secrets:
+
+| Variable          | Value                                  |
+|-------------------|----------------------------------------|
+| `VITE_API_BASE`   | `https://brain-api.ward-forge.com`     |
 
 ## Maintenance
 

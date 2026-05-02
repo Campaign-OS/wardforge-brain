@@ -9,8 +9,16 @@
  * user message. Older turns in the conversation history don't carry substrate
  * — keeps context bounded and ensures the brain always sees current state.
  *
- * The fetch_file tool is available across turns; the model can pull files
- * mid-conversation as the topic shifts.
+ * Tools available to the brain:
+ * - fetch_file: read any allowlisted file in the repo
+ * - propose_commitment_create: stage a new commitment for user confirmation
+ * - propose_commitment_update: stage a status/horizon/etc change to an
+ *   existing commitment for user confirmation
+ *
+ * Proposals created via tool calls are returned in the response payload as
+ * `pending_proposals[]` so the frontend can render confirm banners. The
+ * propose-confirm pattern is preserved — the brain doesn't write to substrate
+ * directly, just stages changes.
  */
 
 import type { Env } from "./index";
@@ -26,6 +34,12 @@ import {
   listRecentThreads,
 } from "./threads";
 import { BRAIN_SYSTEM_PROMPT, buildUserPrompt } from "./prompts";
+import {
+  proposeCreate,
+  proposeUpdate,
+  type Commitment,
+  type ProposalDescriptor,
+} from "./commitments";
 
 interface QueryRequest {
   question: string;
@@ -60,6 +74,83 @@ const TOOLS = [
         },
       },
       required: ["path"],
+    },
+  },
+  {
+    name: "propose_commitment_create",
+    description:
+      "Stage a NEW commitment for the user to confirm. The user reviews via a " +
+      "confirm banner in the UI; nothing is written to substrate until they confirm. " +
+      "Use this when the user has clearly committed to a piece of work in the " +
+      "conversation (e.g. 'I'm going to ship X by Friday'). Do NOT use for " +
+      "speculative ideas, brainstorming, or aspirational statements. The user must " +
+      "have made an actual commitment, even if implicitly. " +
+      "After staging, briefly mention it in your response so the user knows to look " +
+      "at the banner. Don't restate the full schema — they see it in the banner.",
+    input_schema: {
+      type: "object",
+      properties: {
+        title: {
+          type: "string",
+          description:
+            "Short imperative phrase, max 80 chars. e.g. 'Ship canvasser tracking feature'",
+        },
+        owner: {
+          type: "string",
+          enum: ["troy", "matthew"],
+          description:
+            "Whose commitment this is. Default to the user making the conversation if unspecified.",
+        },
+        horizon: {
+          type: "string",
+          enum: ["today", "this-week", "later"],
+          description:
+            "Time horizon. 'today' for same-day work, 'this-week' for current sprint, 'later' for future.",
+        },
+        deadline: {
+          type: "string",
+          description:
+            "Optional hard deadline as YYYY-MM-DD. Omit if no specific date.",
+        },
+        notes: {
+          type: "string",
+          description:
+            "Optional context, max 500 chars. Why this commitment exists, dependencies, etc.",
+        },
+      },
+      required: ["title", "horizon"],
+    },
+  },
+  {
+    name: "propose_commitment_update",
+    description:
+      "Stage a CHANGE to an existing commitment for the user to confirm. Common " +
+      "uses: marking a commitment blocked when the user mentions a blocker, " +
+      "moving horizon from 'later' to 'today' when priorities shift, updating " +
+      "deadline. The user reviews via a confirm banner. " +
+      "Only propose updates when the user's message is unambiguous about the " +
+      "change. If you're inferring, ask first rather than proposing.",
+    input_schema: {
+      type: "object",
+      properties: {
+        id: {
+          type: "string",
+          description:
+            "The commitment id, e.g. 'c-2026-05-02-004'. Must match an existing commitment in the substrate.",
+        },
+        field: {
+          type: "string",
+          enum: ["status", "horizon", "deadline", "owner", "title", "notes"],
+          description: "Which field to change.",
+        },
+        new_value: {
+          type: "string",
+          description:
+            "New value for the field. For status: open|in-progress|blocked|done|dropped. " +
+            "For horizon: today|this-week|later. For deadline: YYYY-MM-DD or empty for null.",
+        },
+      },
+      required: ["id", "field", "new_value"],
     },
   },
 ];
@@ -101,32 +192,123 @@ const callClaude = async (
   return (await apiResp.json()) as ClaudeResponse;
 };
 
+interface ToolExecutionResult {
+  toolResult: Extract<ContentBlock, { type: "tool_result" }>;
+  fileFetched?: string;
+  proposalCreated?: ProposalDescriptor;
+}
+
 const executeToolCall = async (
   env: Env,
+  user: SessionUser,
   block: Extract<ContentBlock, { type: "tool_use" }>
-): Promise<Extract<ContentBlock, { type: "tool_result" }>> => {
-  if (block.name !== "fetch_file") {
+): Promise<ToolExecutionResult> => {
+  if (block.name === "fetch_file") {
+    const path = String((block.input as { path?: unknown }).path ?? "");
+    const result = await fetchFileForBrain(env, path);
+    if (!result.ok) {
+      return {
+        toolResult: {
+          type: "tool_result",
+          tool_use_id: block.id,
+          content: result.error,
+          is_error: true,
+        },
+      };
+    }
     return {
+      toolResult: {
+        type: "tool_result",
+        tool_use_id: block.id,
+        content: `[BEGIN FILE CONTENT — path: ${path}]\n${result.content}\n[END FILE CONTENT]`,
+      },
+      fileFetched: path,
+    };
+  }
+
+  if (block.name === "propose_commitment_create") {
+    const input = block.input as Partial<Commitment>;
+    const result = await proposeCreate(env, user, input, "brain");
+    if (!result.ok) {
+      return {
+        toolResult: {
+          type: "tool_result",
+          tool_use_id: block.id,
+          content: `proposal failed: ${result.error}`,
+          is_error: true,
+        },
+      };
+    }
+    return {
+      toolResult: {
+        type: "tool_result",
+        tool_use_id: block.id,
+        content:
+          `proposal staged. token=${result.descriptor.token}. ` +
+          `description="${result.descriptor.description}". ` +
+          `The user will see a confirm banner in the UI. ` +
+          `Mention this briefly in your response without restating the schema.`,
+      },
+      proposalCreated: result.descriptor,
+    };
+  }
+
+  if (block.name === "propose_commitment_update") {
+    const input = block.input as {
+      id?: string;
+      field?: keyof Commitment;
+      new_value?: string;
+    };
+    if (!input.id || !input.field) {
+      return {
+        toolResult: {
+          type: "tool_result",
+          tool_use_id: block.id,
+          content: "id and field are required",
+          is_error: true,
+        },
+      };
+    }
+    const result = await proposeUpdate(
+      env,
+      user,
+      {
+        id: input.id,
+        field: input.field,
+        new_value: input.new_value ?? null,
+      },
+      "brain"
+    );
+    if (!result.ok) {
+      return {
+        toolResult: {
+          type: "tool_result",
+          tool_use_id: block.id,
+          content: `proposal failed: ${result.error}`,
+          is_error: true,
+        },
+      };
+    }
+    return {
+      toolResult: {
+        type: "tool_result",
+        tool_use_id: block.id,
+        content:
+          `proposal staged. token=${result.descriptor.token}. ` +
+          `description="${result.descriptor.description}". ` +
+          `The user will see a confirm banner in the UI.`,
+      },
+      proposalCreated: result.descriptor,
+    };
+  }
+
+  return {
+    toolResult: {
       type: "tool_result",
       tool_use_id: block.id,
       content: `unknown tool: ${block.name}`,
       is_error: true,
-    };
-  }
-  const path = String((block.input as { path?: unknown }).path ?? "");
-  const result = await fetchFileForBrain(env, path);
-  if (!result.ok) {
-    return {
-      type: "tool_result",
-      tool_use_id: block.id,
-      content: result.error,
-      is_error: true,
-    };
-  }
-  return {
-    type: "tool_result",
-    tool_use_id: block.id,
-    content: `[BEGIN FILE CONTENT — path: ${path}]\n${result.content}\n[END FILE CONTENT]`,
+    },
   };
 };
 
@@ -149,7 +331,6 @@ export const handleQuery = async (
     );
   }
 
-  // Resolve thread: use existing or create new.
   let threadId = body.thread_id;
   let priorTurns: Awaited<ReturnType<typeof fetchTurns>> = [];
 
@@ -167,7 +348,6 @@ export const handleQuery = async (
     threadId = newThread.id;
   }
 
-  // Load substrate fresh for this turn.
   const [substrate, recentThreads] = await Promise.all([
     buildSubstrateContext(ctx.env),
     buildRecentThreadsContext(ctx.env, 10),
@@ -175,21 +355,18 @@ export const handleQuery = async (
 
   const userPromptContent = buildUserPrompt(body.question, substrate, recentThreads);
 
-  // Build messages array: prior turns (just text) + current user message
-  // (text + substrate).
   const messages: Array<{ role: "user" | "assistant"; content: string | ContentBlock[] }> = [
     ...buildMessageHistory(priorTurns),
     { role: "user", content: userPromptContent },
   ];
 
-  // Persist the user turn now (using just the question, not the substrate-laden
-  // prompt). Even if Claude errors out, the question is recorded.
   await appendTurn(ctx.env, threadId, "user", body.question);
 
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
   let finalAnswer = "";
   const filesFetched: string[] = [];
+  const pendingProposals: ProposalDescriptor[] = [];
 
   try {
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
@@ -210,12 +387,17 @@ export const handleQuery = async (
       const toolUses = resp.content.filter(
         (b): b is Extract<ContentBlock, { type: "tool_use" }> => b.type === "tool_use"
       );
-      const toolResults = await Promise.all(toolUses.map((t) => executeToolCall(ctx.env, t)));
-      for (const t of toolUses) {
-        const path = String((t.input as { path?: unknown }).path ?? "");
-        if (path) filesFetched.push(path);
+      const toolResults = await Promise.all(
+        toolUses.map((t) => executeToolCall(ctx.env, ctx.user, t))
+      );
+      for (const r of toolResults) {
+        if (r.fileFetched) filesFetched.push(r.fileFetched);
+        if (r.proposalCreated) pendingProposals.push(r.proposalCreated);
       }
-      messages.push({ role: "user", content: toolResults });
+      messages.push({
+        role: "user",
+        content: toolResults.map((r) => r.toolResult),
+      });
     }
   } catch (err) {
     console.error("brain query failed", err);
@@ -231,7 +413,6 @@ export const handleQuery = async (
       "I hit the tool-call limit without finishing the answer. Try asking a more specific question.";
   }
 
-  // Persist the assistant turn.
   await appendTurn(ctx.env, threadId, "assistant", finalAnswer);
 
   return new Response(
@@ -240,6 +421,7 @@ export const handleQuery = async (
       thread_id: threadId,
       usage: { input_tokens: totalInputTokens, output_tokens: totalOutputTokens },
       files_fetched: filesFetched,
+      pending_proposals: pendingProposals,
       asked_by: ctx.user.email,
     }),
     { headers: { "content-type": "application/json", ...cors } }

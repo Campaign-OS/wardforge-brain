@@ -5,14 +5,16 @@
  * is a YAML block separated by `---`. The file is canonical; this module
  * parses it for read APIs and rewrites it for write APIs.
  *
- * Why YAML-in-markdown rather than JSON or a database:
- * - Git-tracked: every status change is a commit. Audit comes free.
- * - Human-readable: editable in any text editor without the dashboard.
- * - Brain-readable: already in substrate, parseable in 50 lines of code.
- * - Diff-able: history is git history.
+ * Architecture:
+ * - Read path: parse the markdown into Commitment objects.
+ * - Write path: regenerate the full file with all blocks, commit via GitHub
+ *   contents API. One commit per change for clean audit history.
+ * - Propose-confirm: every change goes through a 5min KV-stored proposal that
+ *   the user (or only the user) can confirm. Same pattern as inbox actions.
  *
- * Migration path: when this scales past ~200 active commitments or when
- * query patterns demand it, the YAML is a clean export source for a real DB.
+ * The brain calls into this module directly via the exposed `propose*`
+ * helpers (no HTTP hop) when it wants to suggest a commitment change from
+ * a chat conversation.
  */
 
 import type { Env } from "./index";
@@ -21,6 +23,7 @@ import { fetchFile } from "./github";
 
 const COMMITMENTS_PATH = "docs/state/commitments.md";
 const GH_API = "https://api.github.com";
+const PROPOSAL_TTL_SECONDS = 5 * 60;
 
 const ghHeaders = (token: string): HeadersInit => ({
   authorization: `Bearer ${token}`,
@@ -31,11 +34,10 @@ const ghHeaders = (token: string): HeadersInit => ({
 
 export type CommitmentStatus = "open" | "in-progress" | "blocked" | "done" | "dropped";
 export type CommitmentHorizon = "today" | "this-week" | "later";
-export type CommitmentOwner = "troy" | "matthew";
 
 export interface Commitment {
   id: string;
-  owner: CommitmentOwner | string; // string fallback for unknown owners
+  owner: string;
   title: string;
   created: string;
   deadline: string | null;
@@ -46,15 +48,15 @@ export interface Commitment {
   notes: string;
 }
 
-const VALID_STATUSES: CommitmentStatus[] = ["open", "in-progress", "blocked", "done", "dropped"];
-const VALID_HORIZONS: CommitmentHorizon[] = ["today", "this-week", "later"];
+export const VALID_STATUSES: CommitmentStatus[] = [
+  "open",
+  "in-progress",
+  "blocked",
+  "done",
+  "dropped",
+];
+export const VALID_HORIZONS: CommitmentHorizon[] = ["today", "this-week", "later"];
 
-/**
- * Parse a single YAML-ish block into a Commitment. Forgiving — missing
- * fields default sensibly, unknown fields ignored. Not full YAML; we only
- * support `key: value` lines (no nesting, no anchors). That's enough for
- * the schema and avoids pulling in a YAML parser.
- */
 const parseBlock = (block: string): Commitment | null => {
   const lines = block.split("\n");
   const fields: Record<string, string> = {};
@@ -65,7 +67,6 @@ const parseBlock = (block: string): Commitment | null => {
     if (colonIdx === -1) continue;
     const key = line.slice(0, colonIdx).trim();
     let value = line.slice(colonIdx + 1).trim();
-    // Strip surrounding quotes
     if (
       (value.startsWith('"') && value.endsWith('"')) ||
       (value.startsWith("'") && value.endsWith("'"))
@@ -93,22 +94,14 @@ const parseBlock = (block: string): Commitment | null => {
   };
 };
 
-/**
- * Split the markdown file into YAML blocks. Each block is between `---`
- * separators. The schema/rules section at the top (before the first `---`
- * that follows the first occurrence) is ignored.
- */
 const splitBlocks = (markdown: string): string[] => {
-  // Normalize line endings
   const normalized = markdown.replace(/\r\n/g, "\n");
-  // Split by lines that are exactly `---`
   const sections = normalized.split(/\n---\n/);
-  // First section is the schema docs; skip it. Each subsequent section is a commitment block.
   return sections.slice(1).filter((s) => s.trim().length > 0);
 };
 
 const formatBlock = (c: Commitment): string => {
-  const lines = [
+  return [
     `id: ${c.id}`,
     `owner: ${c.owner}`,
     `title: ${c.title}`,
@@ -119,8 +112,7 @@ const formatBlock = (c: Commitment): string => {
     `source: ${c.source}`,
     `completed: ${c.completed ?? "null"}`,
     `notes: ${c.notes}`,
-  ];
-  return lines.join("\n");
+  ].join("\n");
 };
 
 const HEADER = `# Commitments
@@ -155,23 +147,15 @@ const formatFile = (commitments: Commitment[]): string => {
   return `${HEADER}\n---\n\n${blocks}\n`;
 };
 
-/**
- * Read all commitments from the substrate. Returns empty array if the file
- * doesn't exist yet — first-time deploy is a clean state.
- */
+const todayStr = (): string => new Date().toISOString().slice(0, 10);
+
 export const fetchAllCommitments = async (env: Env): Promise<Commitment[]> => {
   const content = await fetchFile(env, COMMITMENTS_PATH);
   if (content.startsWith("(") && content.endsWith(" not found)")) return [];
   const blocks = splitBlocks(content);
-  return blocks
-    .map(parseBlock)
-    .filter((c): c is Commitment => c !== null);
+  return blocks.map(parseBlock).filter((c): c is Commitment => c !== null);
 };
 
-/**
- * Write the full commitments list back to the substrate. One commit per
- * change. The dashboard never batches — every change is its own audit entry.
- */
 const writeCommitments = async (
   env: Env,
   commitments: Commitment[],
@@ -183,7 +167,6 @@ const writeCommitments = async (
     COMMITMENTS_PATH
   )}`;
 
-  // Get current SHA (or null if file doesn't exist yet)
   const getResp = await fetch(url, { headers: ghHeaders(env.GITHUB_TOKEN) });
   let sha: string | undefined;
   if (getResp.ok) {
@@ -219,6 +202,259 @@ const writeCommitments = async (
   return { commitSha: result.commit.sha };
 };
 
+const generateId = async (env: Env): Promise<string> => {
+  const today = todayStr();
+  const all = await fetchAllCommitments(env);
+  const todayPrefix = `c-${today}-`;
+  const existingNumbers = all
+    .filter((c) => c.id.startsWith(todayPrefix))
+    .map((c) => parseInt(c.id.slice(todayPrefix.length), 10))
+    .filter((n) => !isNaN(n));
+  const next = existingNumbers.length === 0 ? 1 : Math.max(...existingNumbers) + 1;
+  return `${todayPrefix}${String(next).padStart(3, "0")}`;
+};
+
+// ---- Proposal records (KV) ----
+
+interface ProposalRecord {
+  kind: "create" | "update";
+  payload: {
+    new_commitment?: Partial<Commitment>;
+    change?: { id: string; field: keyof Commitment; new_value: string | null };
+  };
+  user: SessionUser;
+  proposedAt: number;
+  source: "dashboard" | "brain"; // who proposed it
+}
+
+export interface ProposalDescriptor {
+  token: string;
+  kind: "commitment-create" | "commitment-update";
+  description: string;
+  preview: ProposalRecord["payload"];
+  source: "dashboard" | "brain";
+  expires_in: number;
+}
+
+const buildDescription = async (
+  env: Env,
+  record: ProposalRecord
+): Promise<string> => {
+  if (record.kind === "create" && record.payload.new_commitment) {
+    const nc = record.payload.new_commitment;
+    return `Add commitment: "${nc.title || ""}" (${nc.owner || "unspecified"}, ${nc.horizon || "later"})`;
+  }
+  if (record.kind === "update" && record.payload.change) {
+    const ch = record.payload.change;
+    // Try to find the existing commitment for richer context
+    const all = await fetchAllCommitments(env);
+    const existing = all.find((c) => c.id === ch.id);
+    const titleHint = existing ? ` (${existing.title})` : "";
+    return `${ch.id}${titleHint}: ${ch.field} → ${ch.new_value ?? "null"}`;
+  }
+  return "Unknown change";
+};
+
+/**
+ * Create a "create commitment" proposal. Returns the descriptor that the
+ * frontend uses to render a confirm banner.
+ *
+ * Caller (HTTP handler or brain tool) is responsible for validating user
+ * authentication. This function trusts the SessionUser passed in.
+ */
+export const proposeCreate = async (
+  env: Env,
+  user: SessionUser,
+  draft: Partial<Commitment>,
+  source: "dashboard" | "brain" = "dashboard"
+): Promise<{ ok: true; descriptor: ProposalDescriptor } | { ok: false; error: string }> => {
+  if (!draft.title || draft.title.trim().length === 0) {
+    return { ok: false, error: "title is required for new commitments" };
+  }
+  if (draft.horizon && !VALID_HORIZONS.includes(draft.horizon)) {
+    return { ok: false, error: `invalid horizon: ${draft.horizon}` };
+  }
+  if (draft.status && !VALID_STATUSES.includes(draft.status)) {
+    return { ok: false, error: `invalid status: ${draft.status}` };
+  }
+
+  const token = crypto.randomUUID();
+  const record: ProposalRecord = {
+    kind: "create",
+    payload: { new_commitment: draft },
+    user,
+    proposedAt: Date.now(),
+    source,
+  };
+  await env.BRAIN_MEMORY.put(`commitment-proposal:${token}`, JSON.stringify(record), {
+    expirationTtl: PROPOSAL_TTL_SECONDS,
+  });
+
+  return {
+    ok: true,
+    descriptor: {
+      token,
+      kind: "commitment-create",
+      description: await buildDescription(env, record),
+      preview: record.payload,
+      source,
+      expires_in: PROPOSAL_TTL_SECONDS,
+    },
+  };
+};
+
+/**
+ * Create an "update commitment" proposal. Validates that the commitment
+ * exists and the field is editable.
+ */
+export const proposeUpdate = async (
+  env: Env,
+  user: SessionUser,
+  change: { id: string; field: keyof Commitment; new_value: string | null },
+  source: "dashboard" | "brain" = "dashboard"
+): Promise<{ ok: true; descriptor: ProposalDescriptor } | { ok: false; error: string }> => {
+  if (!change.id || !change.field) {
+    return { ok: false, error: "change must include id and field" };
+  }
+
+  // Verify the commitment exists
+  const all = await fetchAllCommitments(env);
+  if (!all.find((c) => c.id === change.id)) {
+    return { ok: false, error: `commitment not found: ${change.id}` };
+  }
+
+  // Validate field-specific values
+  if (change.field === "status") {
+    if (!VALID_STATUSES.includes(change.new_value as CommitmentStatus)) {
+      return { ok: false, error: `invalid status: ${change.new_value}` };
+    }
+  }
+  if (change.field === "horizon") {
+    if (!VALID_HORIZONS.includes(change.new_value as CommitmentHorizon)) {
+      return { ok: false, error: `invalid horizon: ${change.new_value}` };
+    }
+  }
+  const editableFields: Array<keyof Commitment> = [
+    "status",
+    "horizon",
+    "deadline",
+    "owner",
+    "title",
+    "notes",
+  ];
+  if (!editableFields.includes(change.field)) {
+    return { ok: false, error: `field not editable: ${change.field}` };
+  }
+
+  const token = crypto.randomUUID();
+  const record: ProposalRecord = {
+    kind: "update",
+    payload: { change },
+    user,
+    proposedAt: Date.now(),
+    source,
+  };
+  await env.BRAIN_MEMORY.put(`commitment-proposal:${token}`, JSON.stringify(record), {
+    expirationTtl: PROPOSAL_TTL_SECONDS,
+  });
+
+  return {
+    ok: true,
+    descriptor: {
+      token,
+      kind: "commitment-update",
+      description: await buildDescription(env, record),
+      preview: record.payload,
+      source,
+      expires_in: PROPOSAL_TTL_SECONDS,
+    },
+  };
+};
+
+const applyProposal = async (
+  env: Env,
+  record: ProposalRecord,
+  user: SessionUser
+): Promise<{ commitSha: string; commitMessage: string }> => {
+  const all = await fetchAllCommitments(env);
+  let updated: Commitment[];
+  let commitMessage: string;
+
+  if (record.kind === "create" && record.payload.new_commitment) {
+    const nc = record.payload.new_commitment;
+    const newCommitment: Commitment = {
+      id: await generateId(env),
+      owner: nc.owner || user.email.split("@")[0],
+      title: (nc.title || "").trim().slice(0, 200),
+      created: todayStr(),
+      deadline: nc.deadline || null,
+      horizon: VALID_HORIZONS.includes(nc.horizon as CommitmentHorizon)
+        ? (nc.horizon as CommitmentHorizon)
+        : "later",
+      status: VALID_STATUSES.includes(nc.status as CommitmentStatus)
+        ? (nc.status as CommitmentStatus)
+        : "open",
+      source: nc.source || `via ${record.source}, by ${user.email}`,
+      completed: null,
+      notes: (nc.notes || "").slice(0, 500),
+    };
+    updated = [...all, newCommitment];
+    commitMessage = `commitments: + ${newCommitment.title.slice(0, 60)} (via ${record.source})`;
+  } else if (record.kind === "update" && record.payload.change) {
+    const ch = record.payload.change;
+    const idx = all.findIndex((c) => c.id === ch.id);
+    if (idx === -1) {
+      throw new Error(`commitment not found: ${ch.id}`);
+    }
+    const existing = all[idx];
+    const next: Commitment = { ...existing };
+    const value = ch.new_value;
+
+    switch (ch.field) {
+      case "status":
+        next.status = value as CommitmentStatus;
+        if (next.status === "done" && !next.completed) {
+          next.completed = todayStr();
+        }
+        if (next.status !== "done") {
+          next.completed = null;
+        }
+        break;
+      case "horizon":
+        next.horizon = value as CommitmentHorizon;
+        break;
+      case "deadline":
+        next.deadline = value === null || value === "" ? null : value;
+        break;
+      case "owner":
+        next.owner = value || existing.owner;
+        break;
+      case "title":
+        next.title = (value || existing.title).slice(0, 200);
+        break;
+      case "notes":
+        next.notes = (value || "").slice(0, 500);
+        break;
+      default:
+        throw new Error(`field not editable: ${ch.field}`);
+    }
+    updated = [...all];
+    updated[idx] = next;
+    commitMessage = `commitments: ${ch.id} ${ch.field} → ${value} (via ${record.source})`;
+  } else {
+    throw new Error("malformed proposal");
+  }
+
+  const result = await writeCommitments(
+    env,
+    updated,
+    commitMessage,
+    user.name,
+    user.email
+  );
+  return { commitSha: result.commitSha, commitMessage };
+};
+
 // ---- HTTP handlers ----
 
 export const handleListCommitments = async (
@@ -234,38 +470,9 @@ export const handleListCommitments = async (
 };
 
 interface CommitmentProposeRequest {
-  // For new commitments
   new_commitment?: Partial<Commitment>;
-  // For changes to existing commitments
-  change?: {
-    id: string;
-    field: keyof Commitment;
-    new_value: string | null;
-  };
+  change?: { id: string; field: keyof Commitment; new_value: string | null };
 }
-
-interface ProposalRecord {
-  kind: "create" | "update";
-  payload: CommitmentProposeRequest;
-  user: SessionUser;
-  proposedAt: number;
-}
-
-const PROPOSAL_TTL_SECONDS = 5 * 60;
-
-const todayStr = (): string => new Date().toISOString().slice(0, 10);
-
-const generateId = async (env: Env): Promise<string> => {
-  const today = todayStr();
-  const all = await fetchAllCommitments(env);
-  const todayPrefix = `c-${today}-`;
-  const existingNumbers = all
-    .filter((c) => c.id.startsWith(todayPrefix))
-    .map((c) => parseInt(c.id.slice(todayPrefix.length), 10))
-    .filter((n) => !isNaN(n));
-  const next = existingNumbers.length === 0 ? 1 : Math.max(...existingNumbers) + 1;
-  return `${todayPrefix}${String(next).padStart(3, "0")}`;
-};
 
 export const handleCommitmentPropose = async (
   request: Request,
@@ -281,43 +488,23 @@ export const handleCommitmentPropose = async (
     );
   }
 
-  const kind: "create" | "update" = body.new_commitment ? "create" : "update";
+  const result = body.new_commitment
+    ? await proposeCreate(ctx.env, ctx.user, body.new_commitment, "dashboard")
+    : await proposeUpdate(ctx.env, ctx.user, body.change!, "dashboard");
 
-  // Validate the payload before storing the proposal
-  if (kind === "create" && body.new_commitment) {
-    if (!body.new_commitment.title || body.new_commitment.title.trim().length === 0) {
-      return new Response(
-        JSON.stringify({ error: "title is required for new commitments" }),
-        { status: 400, headers: { "content-type": "application/json", ...cors } }
-      );
-    }
+  if (!result.ok) {
+    return new Response(JSON.stringify({ error: result.error }), {
+      status: 400,
+      headers: { "content-type": "application/json", ...cors },
+    });
   }
-  if (kind === "update" && body.change) {
-    if (!body.change.id || !body.change.field) {
-      return new Response(
-        JSON.stringify({ error: "change must include id and field" }),
-        { status: 400, headers: { "content-type": "application/json", ...cors } }
-      );
-    }
-  }
-
-  const token = crypto.randomUUID();
-  const record: ProposalRecord = {
-    kind,
-    payload: body,
-    user: ctx.user,
-    proposedAt: Date.now(),
-  };
-  await ctx.env.BRAIN_MEMORY.put(`commitment-proposal:${token}`, JSON.stringify(record), {
-    expirationTtl: PROPOSAL_TTL_SECONDS,
-  });
 
   return new Response(
     JSON.stringify({
-      token,
-      kind,
-      preview: body,
-      expires_in: PROPOSAL_TTL_SECONDS,
+      token: result.descriptor.token,
+      kind: result.descriptor.kind === "commitment-create" ? "create" : "update",
+      preview: result.descriptor.preview,
+      expires_in: result.descriptor.expires_in,
     }),
     { headers: { "content-type": "application/json", ...cors } }
   );
@@ -352,114 +539,22 @@ export const handleCommitmentConfirm = async (
     );
   }
 
-  const all = await fetchAllCommitments(ctx.env);
-  let updated: Commitment[];
-  let commitMessage: string;
-
-  if (record.kind === "create" && record.payload.new_commitment) {
-    const nc = record.payload.new_commitment;
-    const newCommitment: Commitment = {
-      id: await generateId(ctx.env),
-      owner: nc.owner || ctx.user.email.split("@")[0],
-      title: (nc.title || "").trim().slice(0, 200),
-      created: todayStr(),
-      deadline: nc.deadline || null,
-      horizon: VALID_HORIZONS.includes(nc.horizon as CommitmentHorizon)
-        ? (nc.horizon as CommitmentHorizon)
-        : "later",
-      status: VALID_STATUSES.includes(nc.status as CommitmentStatus)
-        ? (nc.status as CommitmentStatus)
-        : "open",
-      source: nc.source || `manual via dashboard, by ${ctx.user.email}`,
-      completed: null,
-      notes: (nc.notes || "").slice(0, 500),
-    };
-    updated = [...all, newCommitment];
-    commitMessage = `commitments: + ${newCommitment.title.slice(0, 60)} (via dashboard)`;
-  } else if (record.kind === "update" && record.payload.change) {
-    const ch = record.payload.change;
-    const idx = all.findIndex((c) => c.id === ch.id);
-    if (idx === -1) {
-      return new Response(JSON.stringify({ error: `commitment not found: ${ch.id}` }), {
-        status: 404,
-        headers: { "content-type": "application/json", ...cors },
-      });
-    }
-    const existing = all[idx];
-    const next: Commitment = { ...existing };
-    const value = ch.new_value;
-
-    // Apply the change with type validation
-    switch (ch.field) {
-      case "status":
-        if (!VALID_STATUSES.includes(value as CommitmentStatus)) {
-          return new Response(JSON.stringify({ error: `invalid status: ${value}` }), {
-            status: 400,
-            headers: { "content-type": "application/json", ...cors },
-          });
-        }
-        next.status = value as CommitmentStatus;
-        // Auto-stamp completed date when moving to done
-        if (next.status === "done" && !next.completed) {
-          next.completed = todayStr();
-        }
-        if (next.status !== "done") {
-          next.completed = null;
-        }
-        break;
-      case "horizon":
-        if (!VALID_HORIZONS.includes(value as CommitmentHorizon)) {
-          return new Response(JSON.stringify({ error: `invalid horizon: ${value}` }), {
-            status: 400,
-            headers: { "content-type": "application/json", ...cors },
-          });
-        }
-        next.horizon = value as CommitmentHorizon;
-        break;
-      case "deadline":
-        next.deadline = value === null || value === "" ? null : value;
-        break;
-      case "owner":
-        next.owner = value || existing.owner;
-        break;
-      case "title":
-        next.title = (value || existing.title).slice(0, 200);
-        break;
-      case "notes":
-        next.notes = (value || "").slice(0, 500);
-        break;
-      default:
-        return new Response(JSON.stringify({ error: `field not editable: ${ch.field}` }), {
-          status: 400,
-          headers: { "content-type": "application/json", ...cors },
-        });
-    }
-    updated = [...all];
-    updated[idx] = next;
-    commitMessage = `commitments: ${ch.id} ${ch.field} → ${value} (via dashboard)`;
-  } else {
-    return new Response(JSON.stringify({ error: "malformed proposal" }), {
-      status: 400,
+  try {
+    const result = await applyProposal(ctx.env, record, ctx.user);
+    await ctx.env.BRAIN_MEMORY.delete(`commitment-proposal:${body.token}`);
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        commit_sha: result.commitSha,
+        commit_url: `https://github.com/${ctx.env.GITHUB_REPO}/commit/${result.commitSha}`,
+      }),
+      { headers: { "content-type": "application/json", ...cors } }
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "apply failed";
+    return new Response(JSON.stringify({ error: msg }), {
+      status: 500,
       headers: { "content-type": "application/json", ...cors },
     });
   }
-
-  const result = await writeCommitments(
-    ctx.env,
-    updated,
-    commitMessage,
-    ctx.user.name,
-    ctx.user.email
-  );
-
-  await ctx.env.BRAIN_MEMORY.delete(`commitment-proposal:${body.token}`);
-
-  return new Response(
-    JSON.stringify({
-      ok: true,
-      commit_sha: result.commitSha,
-      commit_url: `https://github.com/${ctx.env.GITHUB_REPO}/commit/${result.commitSha}`,
-    }),
-    { headers: { "content-type": "application/json", ...cors } }
-  );
 };

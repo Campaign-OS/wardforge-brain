@@ -1,7 +1,12 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { api, type User, type ThreadSummary } from "./api";
+import {
+  api,
+  type User,
+  type ThreadSummary,
+  type PendingProposal,
+} from "./api";
 import Dashboard from "./Dashboard";
 
 interface Message {
@@ -11,10 +16,21 @@ interface Message {
 }
 
 interface InboxProposal {
+  kind: "inbox";
   token: string;
   line: string;
   expires_at: number;
 }
+
+interface CommitmentBannerProposal {
+  kind: "commitment";
+  token: string;
+  proposalKind: "commitment-create" | "commitment-update";
+  description: string;
+  expires_at: number;
+}
+
+type BannerProposal = InboxProposal | CommitmentBannerProposal;
 
 const fmtTime = (ts: number): string =>
   new Date(ts).toLocaleString(undefined, {
@@ -43,8 +59,8 @@ export default function App() {
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [currentThreadId, setCurrentThreadId] = useState<string | null>(null);
   const [loadingThread, setLoadingThread] = useState(false);
-  const [proposal, setProposal] = useState<InboxProposal | null>(null);
-  const [proposalEdit, setProposalEdit] = useState("");
+  const [banners, setBanners] = useState<BannerProposal[]>([]);
+  const [inboxEdit, setInboxEdit] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // Auth check on mount
@@ -55,7 +71,6 @@ export default function App() {
     });
   }, []);
 
-  // Update browser URL when view changes (lightweight, no router)
   useEffect(() => {
     if (typeof window === "undefined") return;
     const path = view === "chat" ? "/chat" : "/";
@@ -64,7 +79,6 @@ export default function App() {
     }
   }, [view]);
 
-  // Browser back/forward support
   useEffect(() => {
     const onPop = () => setView(initialView());
     window.addEventListener("popstate", onPop);
@@ -92,7 +106,7 @@ export default function App() {
     setCurrentThreadId(null);
     setMessages([]);
     setInput("");
-    setProposal(null);
+    setBanners([]);
   };
 
   const loadThread = async (threadId: string) => {
@@ -108,7 +122,7 @@ export default function App() {
           ts: t.ts,
         }))
       );
-      setProposal(null);
+      setBanners([]);
     }
     setLoadingThread(false);
     setTimeout(() => {
@@ -134,6 +148,19 @@ export default function App() {
         { role: "assistant", content: r.data.answer, ts: Date.now() },
       ]);
       setCurrentThreadId(r.data.thread_id);
+      // Surface any commitment proposals the brain staged via tools
+      if (r.data.pending_proposals && r.data.pending_proposals.length > 0) {
+        const newBanners: CommitmentBannerProposal[] = r.data.pending_proposals.map(
+          (p: PendingProposal) => ({
+            kind: "commitment",
+            token: p.token,
+            proposalKind: p.kind,
+            description: p.description,
+            expires_at: Date.now() + p.expires_in * 1000,
+          })
+        );
+        setBanners((prev) => [...prev, ...newBanners]);
+      }
       refreshThreads();
     } else {
       setMessages((prev) => [
@@ -147,42 +174,72 @@ export default function App() {
     }
   };
 
-  const proposeAdd = async (intent: string) => {
+  const proposeInbox = async (intent: string) => {
     const r = await api.proposeInbox(intent);
     if (r.ok) {
-      setProposal({
-        token: r.data.token,
-        line: r.data.proposal.line,
-        expires_at: Date.now() + r.data.expires_in * 1000,
-      });
-      setProposalEdit(r.data.proposal.line);
+      setBanners((prev) => [
+        ...prev,
+        {
+          kind: "inbox",
+          token: r.data.token,
+          line: r.data.proposal.line,
+          expires_at: Date.now() + r.data.expires_in * 1000,
+        },
+      ]);
+      setInboxEdit(r.data.proposal.line);
     }
   };
 
-  const confirmProposal = async () => {
-    if (!proposal) return;
-    const r = await api.confirmInbox(proposal.token, proposalEdit);
-    if (r.ok) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "system",
-          content: `✓ Added to inbox: "${r.data.committed}". [View commit](${r.data.commit_url})`,
-          ts: Date.now(),
-        },
-      ]);
-      setProposal(null);
-      setProposalEdit("");
+  const confirmBanner = async (b: BannerProposal) => {
+    if (b.kind === "inbox") {
+      const r = await api.confirmInbox(b.token, inboxEdit);
+      if (r.ok) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "system",
+            content: `✓ Added to inbox: "${r.data.committed}". [View commit](${r.data.commit_url})`,
+            ts: Date.now(),
+          },
+        ]);
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "system",
+            content: `Inbox add failed: ${r.error}`,
+            ts: Date.now(),
+          },
+        ]);
+      }
     } else {
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "system",
-          content: `Inbox add failed: ${r.error}`,
-          ts: Date.now(),
-        },
-      ]);
+      const r = await api.commitments.confirm(b.token);
+      if (r.ok) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "system",
+            content: `✓ Committed: ${b.description}. [View commit](${r.data.commit_url})`,
+            ts: Date.now(),
+          },
+        ]);
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "system",
+            content: `Commitment update failed: ${r.error}`,
+            ts: Date.now(),
+          },
+        ]);
+      }
     }
+    dismissBanner(b);
+  };
+
+  const dismissBanner = (b: BannerProposal) => {
+    setBanners((prev) => prev.filter((x) => x.token !== b.token));
+    if (b.kind === "inbox") setInboxEdit("");
   };
 
   if (!authChecked) {
@@ -215,7 +272,6 @@ export default function App() {
     );
   }
 
-  // Top nav present in both views
   const TopNav = () => (
     <div className="border-b border-stone-800 px-4 py-2 flex items-center justify-between">
       <div className="flex items-center gap-1">
@@ -261,12 +317,10 @@ export default function App() {
     );
   }
 
-  // Chat view
   return (
     <div className="flex flex-col h-screen">
       <TopNav />
       <div className="flex-1 flex overflow-hidden">
-        {/* Sidebar */}
         <aside className="w-72 border-r border-stone-800 flex flex-col">
           <div className="p-3 border-b border-stone-800">
             <button
@@ -302,7 +356,6 @@ export default function App() {
           </div>
         </aside>
 
-        {/* Main chat area */}
         <main className="flex-1 flex flex-col">
           <div ref={scrollRef} className="flex-1 overflow-y-auto p-6 space-y-6">
             {messages.length === 0 && !loadingThread && (
@@ -319,7 +372,9 @@ export default function App() {
                 </ul>
                 <p className="mt-4 text-stone-600">
                   Conversations are threaded — follow-ups stay in context. Use{" "}
-                  <em>+ New thread</em> to start fresh.
+                  <em>+ New thread</em> to start fresh. The brain can also stage
+                  commitments for confirmation when you mention them in the
+                  conversation.
                 </p>
               </div>
             )}
@@ -355,7 +410,7 @@ export default function App() {
                   <div className="mt-2 flex gap-2 text-xs">
                     <button
                       onClick={() =>
-                        proposeAdd(
+                        proposeInbox(
                           `From brain on ${new Date(m.ts).toLocaleDateString()}: ${
                             messages[i - 1]?.content?.slice(0, 80) ||
                             "follow up"
@@ -377,33 +432,51 @@ export default function App() {
             )}
           </div>
 
-          {proposal && (
-            <div className="border-t border-amber-700 bg-amber-950/30 p-4">
-              <div className="max-w-3xl mx-auto">
-                <div className="text-xs uppercase tracking-wide text-amber-400 mb-2">
-                  Proposed inbox addition — review before confirming
+          {/* Banner stack — inbox proposals get an editable line, commitment proposals are confirm-only */}
+          {banners.length > 0 && (
+            <div className="border-t border-amber-700 bg-amber-950/30">
+              {banners.map((b) => (
+                <div
+                  key={b.token}
+                  className="p-4 border-b border-amber-900/40 last:border-b-0"
+                >
+                  <div className="max-w-3xl mx-auto">
+                    <div className="text-xs uppercase tracking-wide text-amber-400 mb-2">
+                      {b.kind === "inbox"
+                        ? "Proposed inbox addition — review before confirming"
+                        : b.proposalKind === "commitment-create"
+                          ? "Brain proposes new commitment — review and confirm"
+                          : "Brain proposes commitment change — review and confirm"}
+                    </div>
+                    {b.kind === "inbox" ? (
+                      <textarea
+                        value={inboxEdit}
+                        onChange={(e) => setInboxEdit(e.target.value)}
+                        className="w-full bg-stone-900 border border-stone-700 rounded p-2 text-sm"
+                        rows={2}
+                      />
+                    ) : (
+                      <div className="text-sm text-stone-100 bg-stone-900/60 border border-stone-700 rounded p-3 break-words">
+                        {b.description}
+                      </div>
+                    )}
+                    <div className="flex gap-2 mt-2">
+                      <button
+                        onClick={() => confirmBanner(b)}
+                        className="px-3 py-1.5 bg-amber-500 text-stone-950 rounded text-sm font-medium"
+                      >
+                        Confirm and commit
+                      </button>
+                      <button
+                        onClick={() => dismissBanner(b)}
+                        className="px-3 py-1.5 text-stone-400 text-sm hover:text-stone-200"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  </div>
                 </div>
-                <textarea
-                  value={proposalEdit}
-                  onChange={(e) => setProposalEdit(e.target.value)}
-                  className="w-full bg-stone-900 border border-stone-700 rounded p-2 text-sm"
-                  rows={2}
-                />
-                <div className="flex gap-2 mt-2">
-                  <button
-                    onClick={confirmProposal}
-                    className="px-3 py-1.5 bg-amber-500 text-stone-950 rounded text-sm font-medium"
-                  >
-                    Confirm and commit
-                  </button>
-                  <button
-                    onClick={() => setProposal(null)}
-                    className="px-3 py-1.5 text-stone-400 text-sm hover:text-stone-200"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </div>
+              ))}
             </div>
           )}
 

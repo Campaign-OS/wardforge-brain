@@ -70,6 +70,22 @@ export interface Commitment {
   notes: string;
 }
 
+/**
+ * A staged proposal returned from the brain when it calls a propose tool.
+ * The frontend renders these as confirm banners in the chat UI.
+ */
+export interface PendingProposal {
+  token: string;
+  kind: "commitment-create" | "commitment-update";
+  description: string;
+  preview: {
+    new_commitment?: Partial<Commitment>;
+    change?: { id: string; field: keyof Commitment; new_value: string | null };
+  };
+  source: "dashboard" | "brain";
+  expires_in: number;
+}
+
 export interface DashboardData {
   signed_in_as: { email: string; name: string; owner_key: string };
   commitments: Commitment[];
@@ -104,6 +120,7 @@ export const api = {
       thread_id: string;
       usage?: { input_tokens: number; output_tokens: number };
       files_fetched?: string[];
+      pending_proposals?: PendingProposal[];
     }>("/api/query", {
       method: "POST",
       body: JSON.stringify(thread_id ? { question, thread_id } : { question }),

@@ -59,6 +59,86 @@ export const fetchRecentCommits = async (env: Env, days = 7): Promise<string[]> 
   );
 };
 
+/**
+ * One API call: list every path in the repo. Used to build the TOC the brain
+ * reads alongside always-loaded substrate. Branch defaults to "main".
+ */
+const fetchRepoTree = async (env: Env, branch = "main"): Promise<string[]> => {
+  const url = `${GH_API}/repos/${env.GITHUB_REPO}/git/trees/${branch}?recursive=1`;
+  const r = await fetch(url, { headers: ghHeaders(env.GITHUB_TOKEN) });
+  if (!r.ok) return [];
+  const data = (await r.json()) as {
+    tree: Array<{ path: string; type: string }>;
+    truncated?: boolean;
+  };
+  return data.tree.filter((t) => t.type === "blob").map((t) => t.path);
+};
+
+/**
+ * Build a tree-formatted listing of all .md files under docs/. The brain reads
+ * this to know what files exist so it can fetch them on demand via the
+ * fetch_file tool. Cheap — one API call, no file content fetches.
+ */
+export const buildTableOfContents = async (env: Env): Promise<string> => {
+  const allPaths = await fetchRepoTree(env);
+  const docs = allPaths
+    .filter((p) => p.startsWith("docs/") && p.endsWith(".md"))
+    .sort();
+
+  if (docs.length === 0) return "(no docs found)";
+
+  // Group by directory for readable output
+  const byDir = new Map<string, string[]>();
+  for (const p of docs) {
+    const lastSlash = p.lastIndexOf("/");
+    const dir = p.slice(0, lastSlash);
+    const file = p.slice(lastSlash + 1);
+    if (!byDir.has(dir)) byDir.set(dir, []);
+    byDir.get(dir)!.push(file);
+  }
+
+  const lines: string[] = [];
+  for (const dir of [...byDir.keys()].sort()) {
+    lines.push(`${dir}/`);
+    for (const f of byDir.get(dir)!.sort()) {
+      lines.push(`  ${f}`);
+    }
+  }
+  return lines.join("\n");
+};
+
+/**
+ * Safe wrapper around fetchFile for use as a brain tool. Restricts to .md
+ * files under docs/ to prevent the model from being tricked into fetching
+ * arbitrary repo contents (workflow files, secrets in CI configs, etc.).
+ */
+export const fetchFileForBrain = async (
+  env: Env,
+  path: string
+): Promise<{ ok: true; content: string } | { ok: false; error: string }> => {
+  if (!path.startsWith("docs/")) {
+    return { ok: false, error: "path must start with 'docs/'" };
+  }
+  if (!path.endsWith(".md")) {
+    return { ok: false, error: "only .md files can be fetched" };
+  }
+  if (path.includes("..") || path.includes("//")) {
+    return { ok: false, error: "invalid path" };
+  }
+  try {
+    const content = await fetchFile(env, path);
+    if (content.startsWith("(") && content.endsWith(" not found)")) {
+      return { ok: false, error: `file not found: ${path}` };
+    }
+    // Cap individual fetches to keep tool-result blocks manageable
+    const capped = content.length > 8000 ? content.slice(0, 8000) + "\n\n[...truncated...]" : content;
+    return { ok: true, content: capped };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "fetch failed";
+    return { ok: false, error: msg };
+  }
+};
+
 const truncate = (text: string, maxChars: number): string =>
   text.length <= maxChars ? text : text.slice(0, maxChars) + "\n\n[...truncated...]";
 
@@ -79,6 +159,7 @@ export const buildSubstrateContext = async (env: Env): Promise<string> => {
     adrFiles,
     stateFiles,
     commits,
+    toc,
   ] = await Promise.all([
     fetchFile(env, "docs/architecture.md").then((t) => truncate(t, 6000)),
     fetchFile(env, "docs/build-plan.md").then((t) => truncate(t, 6000)),
@@ -88,6 +169,7 @@ export const buildSubstrateContext = async (env: Env): Promise<string> => {
     listDir(env, "docs/decisions"),
     listDir(env, "docs/state"),
     fetchRecentCommits(env, 14),
+    buildTableOfContents(env),
   ]);
 
   // Pull last 5 ADRs by name (assumes NNNN-name.md sorting)
@@ -136,6 +218,9 @@ export const buildSubstrateContext = async (env: Env): Promise<string> => {
     "",
     "## Commits — past 14 days",
     commits.join("\n") || "(no commits)",
+    "",
+    "## Full file index (use fetch_file to read any of these)",
+    toc,
   ].join("\n");
 };
 

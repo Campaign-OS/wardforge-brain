@@ -1,32 +1,39 @@
 /**
- * Layer 1 — query handler.
+ * Layer 1 — query handler with multi-turn threads.
  *
- * Receives a question, loads substrate (foundational files + TOC), calls
- * Claude API with the fetch_file tool, executes any tool calls until the
- * model produces a final answer, returns the answer. Also records the
- * query/answer pair to memory (Layer 2).
+ * Each query belongs to a thread. If the request omits thread_id, a new
+ * thread is created from the first question. Subsequent turns reference
+ * the same thread_id to continue the conversation.
  *
- * The fetch_file tool lets the model pull specific files from the repo on
- * demand. The TOC in the substrate tells it what's available; the model
- * decides what to fetch based on the question.
+ * Substrate is loaded fresh on every turn and injected only into the latest
+ * user message. Older turns in the conversation history don't carry substrate
+ * — keeps context bounded and ensures the brain always sees current state.
+ *
+ * The fetch_file tool is available across turns; the model can pull files
+ * mid-conversation as the topic shifts.
  */
 
 import type { Env } from "./index";
 import type { SessionUser } from "./auth";
 import { buildSubstrateContext, fetchFileForBrain } from "./github";
-import { buildRecentQueriesContext, fetchRecentQueries, recordQuery } from "./memory";
+import {
+  appendTurn,
+  buildMessageHistory,
+  buildRecentThreadsContext,
+  createThread,
+  fetchThread,
+  fetchTurns,
+  listRecentThreads,
+} from "./threads";
 import { BRAIN_SYSTEM_PROMPT, buildUserPrompt } from "./prompts";
 
 interface QueryRequest {
   question: string;
+  thread_id?: string;
 }
 
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 const MODEL = "claude-opus-4-7";
-
-// Cap the number of tool-use rounds. Each round = one model call + one tool
-// execution. 6 rounds is plenty for any realistic query and prevents runaway
-// costs if the model gets confused.
 const MAX_TOOL_ROUNDS = 6;
 
 const TOOLS = [
@@ -57,7 +64,6 @@ const TOOLS = [
   },
 ];
 
-// Anthropic content blocks come in several shapes; type just enough to navigate.
 type ContentBlock =
   | { type: "text"; text: string }
   | { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
@@ -143,17 +149,42 @@ export const handleQuery = async (
     );
   }
 
-  const [substrate, recentQueries] = await Promise.all([
+  // Resolve thread: use existing or create new.
+  let threadId = body.thread_id;
+  let priorTurns: Awaited<ReturnType<typeof fetchTurns>> = [];
+
+  if (threadId) {
+    const existing = await fetchThread(ctx.env, threadId);
+    if (!existing) {
+      return new Response(
+        JSON.stringify({ error: `thread not found: ${threadId}` }),
+        { status: 404, headers: { "content-type": "application/json", ...cors } }
+      );
+    }
+    priorTurns = await fetchTurns(ctx.env, threadId);
+  } else {
+    const newThread = await createThread(ctx.env, ctx.user, body.question);
+    threadId = newThread.id;
+  }
+
+  // Load substrate fresh for this turn.
+  const [substrate, recentThreads] = await Promise.all([
     buildSubstrateContext(ctx.env),
-    buildRecentQueriesContext(ctx.env, 10),
+    buildRecentThreadsContext(ctx.env, 10),
   ]);
 
-  const userPrompt = buildUserPrompt(body.question, substrate, recentQueries);
+  const userPromptContent = buildUserPrompt(body.question, substrate, recentThreads);
 
-  // Conversation messages — accumulates across tool-use rounds.
+  // Build messages array: prior turns (just text) + current user message
+  // (text + substrate).
   const messages: Array<{ role: "user" | "assistant"; content: string | ContentBlock[] }> = [
-    { role: "user", content: userPrompt },
+    ...buildMessageHistory(priorTurns),
+    { role: "user", content: userPromptContent },
   ];
+
+  // Persist the user turn now (using just the question, not the substrate-laden
+  // prompt). Even if Claude errors out, the question is recorded.
+  await appendTurn(ctx.env, threadId, "user", body.question);
 
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
@@ -166,7 +197,6 @@ export const handleQuery = async (
       totalInputTokens += resp.usage?.input_tokens ?? 0;
       totalOutputTokens += resp.usage?.output_tokens ?? 0;
 
-      // Append the assistant's response (text + any tool_use blocks) to history.
       messages.push({ role: "assistant", content: resp.content });
 
       if (resp.stop_reason !== "tool_use") {
@@ -177,7 +207,6 @@ export const handleQuery = async (
         break;
       }
 
-      // Model wants to call tools. Execute every tool_use block in parallel.
       const toolUses = resp.content.filter(
         (b): b is Extract<ContentBlock, { type: "tool_use" }> => b.type === "tool_use"
       );
@@ -191,7 +220,7 @@ export const handleQuery = async (
   } catch (err) {
     console.error("brain query failed", err);
     const msg = err instanceof Error ? err.message : "internal error";
-    return new Response(JSON.stringify({ error: msg }), {
+    return new Response(JSON.stringify({ error: msg, thread_id: threadId }), {
       status: 502,
       headers: { "content-type": "application/json", ...cors },
     });
@@ -202,12 +231,13 @@ export const handleQuery = async (
       "I hit the tool-call limit without finishing the answer. Try asking a more specific question.";
   }
 
-  // Fire-and-forget memory record — don't block response on KV write.
-  await recordQuery(ctx.env, ctx.user, body.question, finalAnswer);
+  // Persist the assistant turn.
+  await appendTurn(ctx.env, threadId, "assistant", finalAnswer);
 
   return new Response(
     JSON.stringify({
       answer: finalAnswer,
+      thread_id: threadId,
       usage: { input_tokens: totalInputTokens, output_tokens: totalOutputTokens },
       files_fetched: filesFetched,
       asked_by: ctx.user.email,
@@ -216,22 +246,55 @@ export const handleQuery = async (
   );
 };
 
-export const handleHistory = async (
+export const handleListThreads = async (
   request: Request,
   ctx: { user: SessionUser; env: Env },
   cors: Record<string, string>
 ): Promise<Response> => {
   const url = new URL(request.url);
-  const limit = Math.min(50, Number(url.searchParams.get("limit")) || 20);
-  const records = await fetchRecentQueries(ctx.env, limit);
+  const limit = Math.min(50, Number(url.searchParams.get("limit")) || 30);
+  const threads = await listRecentThreads(ctx.env, limit);
   return new Response(
     JSON.stringify({
-      queries: records.map((r) => ({
-        id: r.id,
-        question: r.question,
-        answer: r.answer,
-        user: r.user,
-        ts: r.ts,
+      threads: threads.map((t) => ({
+        id: t.id,
+        title: t.title,
+        created_by: t.created_by,
+        created_at: t.created_at,
+        updated_at: t.updated_at,
+      })),
+    }),
+    { headers: { "content-type": "application/json", ...cors } }
+  );
+};
+
+export const handleGetThread = async (
+  threadId: string,
+  ctx: { user: SessionUser; env: Env },
+  cors: Record<string, string>
+): Promise<Response> => {
+  const thread = await fetchThread(ctx.env, threadId);
+  if (!thread) {
+    return new Response(JSON.stringify({ error: "thread not found" }), {
+      status: 404,
+      headers: { "content-type": "application/json", ...cors },
+    });
+  }
+  const turns = await fetchTurns(ctx.env, threadId);
+  return new Response(
+    JSON.stringify({
+      thread: {
+        id: thread.id,
+        title: thread.title,
+        created_by: thread.created_by,
+        created_at: thread.created_at,
+        updated_at: thread.updated_at,
+      },
+      turns: turns.map((t) => ({
+        id: t.id,
+        role: t.role,
+        content: t.content,
+        ts: t.ts,
       })),
     }),
     { headers: { "content-type": "application/json", ...cors } }

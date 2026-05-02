@@ -1,7 +1,7 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { api, type User } from "./api";
+import { api, type User, type ThreadSummary } from "./api";
 
 interface Message {
   role: "user" | "assistant" | "system";
@@ -29,9 +29,9 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [history, setHistory] = useState<
-    Array<{ id: string; question: string; user: User; ts: number }>
-  >([]);
+  const [threads, setThreads] = useState<ThreadSummary[]>([]);
+  const [currentThreadId, setCurrentThreadId] = useState<string | null>(null);
+  const [loadingThread, setLoadingThread] = useState(false);
   const [proposal, setProposal] = useState<InboxProposal | null>(null);
   const [proposalEdit, setProposalEdit] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -44,29 +44,49 @@ export default function App() {
     });
   }, []);
 
-  // Load history on login
-  const refreshHistory = useCallback(async () => {
-    const r = await api.history(20);
-    if (r.ok) {
-      setHistory(
-        r.data.queries.map((q) => ({
-          id: q.id,
-          question: q.question,
-          user: q.user,
-          ts: q.ts,
-        }))
-      );
-    }
+  const refreshThreads = useCallback(async () => {
+    const r = await api.threads.list(30);
+    if (r.ok) setThreads(r.data.threads);
   }, []);
 
   useEffect(() => {
-    if (user) refreshHistory();
-  }, [user, refreshHistory]);
+    if (user) refreshThreads();
+  }, [user, refreshThreads]);
 
-  // Scroll to bottom on new message
+  // Scroll to bottom on new message (but not on thread-switch loads)
   useEffect(() => {
+    if (loadingThread) return;
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages]);
+  }, [messages, loadingThread]);
+
+  const startNewThread = () => {
+    setCurrentThreadId(null);
+    setMessages([]);
+    setInput("");
+    setProposal(null);
+  };
+
+  const loadThread = async (threadId: string) => {
+    if (threadId === currentThreadId) return;
+    setLoadingThread(true);
+    const r = await api.threads.get(threadId);
+    if (r.ok) {
+      setCurrentThreadId(threadId);
+      setMessages(
+        r.data.turns.map((t) => ({
+          role: t.role,
+          content: t.content,
+          ts: t.ts,
+        }))
+      );
+      setProposal(null);
+    }
+    setLoadingThread(false);
+    // Jump scroll to bottom on thread load
+    setTimeout(() => {
+      scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+    }, 50);
+  };
 
   const submit = async () => {
     if (!input.trim() || loading) return;
@@ -75,14 +95,16 @@ export default function App() {
     setMessages((prev) => [...prev, { role: "user", content: question, ts: Date.now() }]);
     setLoading(true);
 
-    const r = await api.query(question);
+    const r = await api.query(question, currentThreadId ?? undefined);
     setLoading(false);
     if (r.ok) {
       setMessages((prev) => [
         ...prev,
         { role: "assistant", content: r.data.answer, ts: Date.now() },
       ]);
-      refreshHistory();
+      // Server is the source of truth for thread_id — first turn creates it.
+      setCurrentThreadId(r.data.thread_id);
+      refreshThreads();
     } else {
       setMessages((prev) => [
         ...prev,
@@ -161,22 +183,34 @@ export default function App() {
           <h1 className="font-semibold">WardForge Brain</h1>
           <div className="text-xs text-stone-500 mt-1">{user.email}</div>
         </div>
-        <div className="flex-1 overflow-y-auto p-4">
-          <div className="text-xs uppercase tracking-wide text-stone-500 mb-2">
-            Recent questions
+        <div className="p-3 border-b border-stone-800">
+          <button
+            onClick={startNewThread}
+            className="w-full px-3 py-2 bg-stone-900 hover:bg-stone-800 border border-stone-700 rounded text-sm text-stone-200 transition"
+          >
+            + New thread
+          </button>
+        </div>
+        <div className="flex-1 overflow-y-auto p-3">
+          <div className="text-xs uppercase tracking-wide text-stone-500 mb-2 px-1">
+            Recent threads
           </div>
-          {history.length === 0 && (
-            <div className="text-xs text-stone-600">No questions yet.</div>
+          {threads.length === 0 && (
+            <div className="text-xs text-stone-600 px-1">No threads yet.</div>
           )}
-          {history.map((q) => (
+          {threads.map((t) => (
             <button
-              key={q.id}
-              onClick={() => setInput(q.question)}
-              className="block w-full text-left text-xs text-stone-300 hover:bg-stone-900 p-2 rounded mb-1"
+              key={t.id}
+              onClick={() => loadThread(t.id)}
+              className={`block w-full text-left text-xs p-2 rounded mb-1 transition ${
+                currentThreadId === t.id
+                  ? "bg-stone-800 text-stone-100"
+                  : "text-stone-300 hover:bg-stone-900"
+              }`}
             >
-              <div className="line-clamp-2">{q.question}</div>
-              <div className="text-stone-600 text-[10px] mt-0.5">
-                {q.user.name.split(" ")[0]} · {fmtTime(q.ts)}
+              <div className="line-clamp-2 leading-snug">{t.title}</div>
+              <div className="text-stone-600 text-[10px] mt-1">
+                {t.created_by.name.split(" ")[0]} · {fmtTime(t.updated_at)}
               </div>
             </button>
           ))}
@@ -194,19 +228,25 @@ export default function App() {
       {/* Main */}
       <main className="flex-1 flex flex-col h-screen">
         <div ref={scrollRef} className="flex-1 overflow-y-auto p-6 space-y-6">
-          {messages.length === 0 && (
+          {messages.length === 0 && !loadingThread && (
             <div className="max-w-2xl mx-auto pt-12 text-stone-500 text-sm">
               <p className="mb-3">Ask anything about WardForge. The brain reads:</p>
               <ul className="list-disc list-inside space-y-1 text-stone-600">
                 <li>architecture, build plan, features</li>
                 <li>recent ADRs and weekly states</li>
                 <li>commits from the past 14 days</li>
-                <li>recent questions other people asked</li>
+                <li>code in src/, worker/, frontend/, lib/, tests/</li>
+                <li>recent threads from across the team</li>
               </ul>
               <p className="mt-4 text-stone-600">
-                Try: <em>"What's our highest-risk dependency?"</em> or{" "}
-                <em>"Why did we pick MapLibre?"</em>
+                Conversations are threaded — follow-ups stay in context. Use{" "}
+                <em>+ New thread</em> to start fresh.
               </p>
+            </div>
+          )}
+          {loadingThread && (
+            <div className="max-w-3xl mx-auto text-stone-500 text-sm italic">
+              Loading thread…
             </div>
           )}
           {messages.map((m, i) => (
@@ -245,9 +285,7 @@ export default function App() {
             </div>
           ))}
           {loading && (
-            <div className="max-w-3xl mx-auto text-stone-500 text-sm italic">
-              Thinking…
-            </div>
+            <div className="max-w-3xl mx-auto text-stone-500 text-sm italic">Thinking…</div>
           )}
         </div>
 
@@ -294,7 +332,9 @@ export default function App() {
                   submit();
                 }
               }}
-              placeholder="Ask the brain anything…"
+              placeholder={
+                currentThreadId ? "Continue this thread…" : "Ask the brain anything…"
+              }
               className="flex-1 bg-stone-900 border border-stone-800 rounded-md px-3 py-2 text-sm resize-none focus:outline-none focus:border-stone-600"
               rows={2}
               disabled={loading}
@@ -304,11 +344,12 @@ export default function App() {
               disabled={loading || !input.trim()}
               className="px-4 py-2 bg-stone-100 text-stone-950 rounded-md text-sm font-medium disabled:opacity-50"
             >
-              Ask
+              {currentThreadId ? "Reply" : "Ask"}
             </button>
           </div>
           <div className="max-w-3xl mx-auto text-xs text-stone-600 mt-2">
-            Enter to send · Shift+Enter for newline · queries are logged for the team
+            Enter to send · Shift+Enter for newline ·{" "}
+            {currentThreadId ? "thread context preserved" : "new thread"}
           </div>
         </div>
       </main>

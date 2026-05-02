@@ -2,21 +2,26 @@
  * WardForge Brain — Cloudflare Worker entry point.
  *
  * Routes:
- *   GET  /healthz                       — liveness check, no auth
+ *   GET  /healthz                          — liveness check, no auth
  *   GET  /session/login                    — start Google OAuth flow
  *   GET  /session/callback                 — OAuth callback, sets session cookie
  *   GET  /session/me                       — return current user or 401
  *   POST /session/logout                   — clear session
- *   POST /api/query                     — Layer 1+2: ask the brain
- *   GET  /api/history?limit=N           — Layer 2: recent queries
- *   POST /api/actions/inbox             — Layer 3: propose adding to inbox
- *   POST /api/actions/inbox/confirm     — Layer 3: confirm and execute
+ *   POST /api/query                        — ask the brain (creates or continues thread)
+ *   GET  /api/threads?limit=N              — list recent threads
+ *   GET  /api/threads/:id                  — fetch a thread with all turns
+ *   POST /api/actions/inbox                — Layer 3: propose adding to inbox
+ *   POST /api/actions/inbox/confirm        — Layer 3: confirm and execute
  *
  * Every /api/* and /session/me route requires a valid session for an
  * @ward-forge.com email.
+ *
+ * NOTE: Routes use /session/* (not /auth/*) because Cloudflare's Free-tier
+ * edge protections silently block /auth/* paths for browser-class clients.
+ * See docs/deployment.md → "Cloudflare path-block gotcha".
  */
 
-import { handleQuery, handleHistory } from "./brain";
+import { handleQuery, handleListThreads, handleGetThread } from "./brain";
 import { handleInboxPropose, handleInboxConfirm } from "./actions";
 import {
   handleLoginStart,
@@ -50,6 +55,8 @@ const cors = (origin: string) => ({
   "access-control-allow-methods": "GET, POST, OPTIONS",
   "access-control-allow-headers": "content-type",
 });
+
+const THREAD_ID_RE = /^\/api\/threads\/([0-9a-f-]+)$/;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -90,8 +97,12 @@ export default {
       if (url.pathname === "/api/query" && request.method === "POST") {
         return handleQuery(request, ctx, cors(origin));
       }
-      if (url.pathname === "/api/history" && request.method === "GET") {
-        return handleHistory(request, ctx, cors(origin));
+      if (url.pathname === "/api/threads" && request.method === "GET") {
+        return handleListThreads(request, ctx, cors(origin));
+      }
+      const threadMatch = url.pathname.match(THREAD_ID_RE);
+      if (threadMatch && request.method === "GET") {
+        return handleGetThread(threadMatch[1], ctx, cors(origin));
       }
       if (url.pathname === "/api/actions/inbox" && request.method === "POST") {
         return handleInboxPropose(request, ctx, cors(origin));

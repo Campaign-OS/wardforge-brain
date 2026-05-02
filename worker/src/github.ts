@@ -84,7 +84,7 @@ export const buildSubstrateContext = async (env: Env): Promise<string> => {
     fetchFile(env, "docs/build-plan.md").then((t) => truncate(t, 6000)),
     fetchFile(env, "docs/features.md").then((t) => truncate(t, 6000)),
     fetchFile(env, "docs/research/legal-regulatory.md").then((t) => truncate(t, 4000)),
-    fetchFile(env, "docs/inbox.md").then((t) => truncate(t, 4000)),
+    fetchFile(env, "docs/inbox/inbox.md").then((t) => truncate(t, 4000)),
     listDir(env, "docs/decisions"),
     listDir(env, "docs/state"),
     fetchRecentCommits(env, 14),
@@ -140,7 +140,7 @@ export const buildSubstrateContext = async (env: Env): Promise<string> => {
 };
 
 /**
- * Append a line to docs/inbox.md. Used by Layer 3 inbox action.
+ * Append a line to docs/inbox/inbox.md. Used by Layer 3 inbox action.
  * Commits via the contents API (read SHA, write updated content).
  */
 export const appendToInbox = async (
@@ -149,7 +149,7 @@ export const appendToInbox = async (
   authorName: string,
   authorEmail: string
 ): Promise<{ commitSha: string }> => {
-  const path = "docs/inbox.md";
+  const path = "docs/inbox/inbox.md";
   const url = `${GH_API}/repos/${env.GITHUB_REPO}/contents/${encodeURIComponent(path)}`;
   const getResp = await fetch(url, { headers: ghHeaders(env.GITHUB_TOKEN) });
   if (!getResp.ok) throw new Error(`could not read inbox: ${getResp.status}`);

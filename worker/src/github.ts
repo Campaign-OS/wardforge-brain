@@ -75,28 +75,117 @@ const fetchRepoTree = async (env: Env, branch = "main"): Promise<string[]> => {
 };
 
 /**
- * Build a tree-formatted listing of all .md files under docs/. The brain reads
- * this to know what files exist so it can fetch them on demand via the
- * fetch_file tool. Cheap — one API call, no file content fetches.
+ * Path access policy — single source of truth for both the TOC (what the
+ * brain knows exists) and fetchFileForBrain (what the brain can actually
+ * read). Allowlist by top-level directory + extension; blocklist for
+ * sensitive patterns. Failing closed: anything not explicitly allowed is
+ * inaccessible.
  */
-export const buildTableOfContents = async (env: Env): Promise<string> => {
-  const allPaths = await fetchRepoTree(env);
-  const docs = allPaths
-    .filter((p) => p.startsWith("docs/") && p.endsWith(".md"))
-    .sort();
+const ALLOWED_TOP_DIRS = [
+  "docs",
+  "src",
+  "worker",
+  "frontend",
+  "lib",
+  "scripts",
+  "tests",
+  "test",
+  "public",
+];
 
-  if (docs.length === 0) return "(no docs found)";
+const ALLOWED_EXTENSIONS = [
+  ".md",
+  ".ts",
+  ".tsx",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+  ".json",
+  ".toml",
+  ".yaml",
+  ".yml",
+  ".txt",
+  ".css",
+  ".html",
+  ".sql",
+];
 
+const BLOCKED_DIRECTORY_NAMES = new Set([
+  "node_modules",
+  "dist",
+  "build",
+  "coverage",
+  ".next",
+  ".vercel",
+  ".wrangler",
+  ".cache",
+]);
+
+const BLOCKED_FILENAMES = new Set([
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "Cargo.lock",
+]);
+
+const BLOCKED_EXTENSIONS = new Set([
+  ".pem",
+  ".key",
+  ".crt",
+  ".p12",
+  ".pfx",
+  ".env",
+]);
+
+const isAccessiblePath = (path: string): boolean => {
+  // Path traversal / weird inputs
+  if (!path || path.includes("..") || path.includes("//") || path.startsWith("/")) {
+    return false;
+  }
+
+  const parts = path.split("/");
+
+  // No hidden components anywhere in the path (.git, .env, .DS_Store, etc.)
+  if (parts.some((p) => p.startsWith("."))) return false;
+
+  // Reject blocked directory names appearing at any depth
+  if (parts.some((p) => BLOCKED_DIRECTORY_NAMES.has(p))) return false;
+
+  const filename = parts[parts.length - 1];
+
+  // Reject blocked filenames
+  if (BLOCKED_FILENAMES.has(filename)) return false;
+
+  // Reject .env, .env.local, .env.production etc. (already caught by hidden check, but explicit)
+  if (filename.startsWith(".env")) return false;
+
+  // Reject blocked extensions
+  for (const ext of BLOCKED_EXTENSIONS) {
+    if (filename.endsWith(ext)) return false;
+  }
+
+  // Extension allowlist
+  const dotIdx = filename.lastIndexOf(".");
+  const ext = dotIdx >= 0 ? filename.slice(dotIdx) : "";
+  if (!ALLOWED_EXTENSIONS.includes(ext)) return false;
+
+  // Top-level dir allowlist OR root-level file with allowed extension
+  if (parts.length === 1) return true;
+  return ALLOWED_TOP_DIRS.includes(parts[0]);
+};
+
+const formatTreeSection = (paths: string[]): string => {
+  if (paths.length === 0) return "(none)";
   // Group by directory for readable output
   const byDir = new Map<string, string[]>();
-  for (const p of docs) {
+  for (const p of paths) {
     const lastSlash = p.lastIndexOf("/");
-    const dir = p.slice(0, lastSlash);
-    const file = p.slice(lastSlash + 1);
+    const dir = lastSlash === -1 ? "(root)" : p.slice(0, lastSlash);
+    const file = lastSlash === -1 ? p : p.slice(lastSlash + 1);
     if (!byDir.has(dir)) byDir.set(dir, []);
     byDir.get(dir)!.push(file);
   }
-
   const lines: string[] = [];
   for (const dir of [...byDir.keys()].sort()) {
     lines.push(`${dir}/`);
@@ -108,22 +197,41 @@ export const buildTableOfContents = async (env: Env): Promise<string> => {
 };
 
 /**
- * Safe wrapper around fetchFile for use as a brain tool. Restricts to .md
- * files under docs/ to prevent the model from being tricked into fetching
- * arbitrary repo contents (workflow files, secrets in CI configs, etc.).
+ * Build a tree-formatted listing of every accessible file in the repo, split
+ * into Docs and Code sections. The brain reads this to know what files exist
+ * so it can fetch them on demand via the fetch_file tool. Cheap — one API
+ * call, no per-file content fetches.
+ */
+export const buildTableOfContents = async (env: Env): Promise<string> => {
+  const allPaths = await fetchRepoTree(env);
+  const accessible = allPaths.filter(isAccessiblePath).sort();
+
+  const docs = accessible.filter((p) => p.startsWith("docs/"));
+  const code = accessible.filter((p) => !p.startsWith("docs/"));
+
+  return [
+    "### Docs",
+    formatTreeSection(docs),
+    "",
+    "### Code",
+    formatTreeSection(code),
+  ].join("\n");
+};
+
+/**
+ * Safe wrapper around fetchFile for use as a brain tool. Uses the same
+ * allowlist/blocklist policy as the TOC so the brain can fetch anything it
+ * sees in the index — and nothing it doesn't.
  */
 export const fetchFileForBrain = async (
   env: Env,
   path: string
 ): Promise<{ ok: true; content: string } | { ok: false; error: string }> => {
-  if (!path.startsWith("docs/")) {
-    return { ok: false, error: "path must start with 'docs/'" };
-  }
-  if (!path.endsWith(".md")) {
-    return { ok: false, error: "only .md files can be fetched" };
-  }
-  if (path.includes("..") || path.includes("//")) {
-    return { ok: false, error: "invalid path" };
+  if (!isAccessiblePath(path)) {
+    return {
+      ok: false,
+      error: `path not accessible: ${path}. Only allowlisted paths under docs/, src/, worker/, frontend/, lib/, scripts/, tests/, test/, public/ (or root-level configs) with allowlisted extensions can be fetched.`,
+    };
   }
   try {
     const content = await fetchFile(env, path);
@@ -131,7 +239,8 @@ export const fetchFileForBrain = async (
       return { ok: false, error: `file not found: ${path}` };
     }
     // Cap individual fetches to keep tool-result blocks manageable
-    const capped = content.length > 8000 ? content.slice(0, 8000) + "\n\n[...truncated...]" : content;
+    const capped =
+      content.length > 8000 ? content.slice(0, 8000) + "\n\n[...truncated...]" : content;
     return { ok: true, content: capped };
   } catch (err) {
     const msg = err instanceof Error ? err.message : "fetch failed";

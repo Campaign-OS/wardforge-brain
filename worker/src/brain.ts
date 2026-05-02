@@ -33,19 +33,23 @@ const TOOLS = [
   {
     name: "fetch_file",
     description:
-      "Fetch the full contents of a markdown file from the substrate repo. " +
-      "Use this when the always-loaded substrate doesn't contain a file you " +
-      "need to answer the question. The 'Full file index' section of the " +
-      "substrate shows you every available path. Only .md files under docs/ " +
-      "are accessible.",
+      "Fetch the full contents of a file from the substrate repo (docs or code). " +
+      "Use this when the always-loaded substrate doesn't contain a file you need " +
+      "to answer the question. The 'Full file index' section of the substrate " +
+      "shows every available path, split into Docs and Code sections. Access is " +
+      "restricted to allowlisted directories (docs/, src/, worker/, frontend/, " +
+      "lib/, scripts/, tests/, test/, public/, plus root-level configs) and " +
+      "extensions (.md, .ts, .tsx, .js, .jsx, .json, .toml, .yaml, .yml, .txt, " +
+      ".css, .html, .sql). Hidden files, lockfiles, build artifacts, secrets, " +
+      "and node_modules are not accessible.",
     input_schema: {
       type: "object",
       properties: {
         path: {
           type: "string",
           description:
-            "Path relative to the repo root. Must start with 'docs/' and end " +
-            "with '.md'. Example: 'docs/sessions/2026-04-15-customer-call.md'",
+            "Path relative to the repo root. Example: 'docs/sessions/2026-04-15.md' " +
+            "or 'src/lib/redirect.ts'. Must be a path that appears in the file index.",
         },
       },
       required: ["path"],
@@ -116,7 +120,7 @@ const executeToolCall = async (
   return {
     type: "tool_result",
     tool_use_id: block.id,
-    content: `=== ${path} ===\n${result.content}`,
+    content: `[BEGIN FILE CONTENT — path: ${path}]\n${result.content}\n[END FILE CONTENT]`,
   };
 };
 

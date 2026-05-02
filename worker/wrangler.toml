@@ -1,0 +1,27 @@
+name = "wardforge-brain"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Custom domain set via the Cloudflare dashboard (Workers & Pages > Settings > Triggers).
+# Aim: brain-api.ward-forge.com routed to this worker.
+# Frontend at brain.ward-forge.com calls this API.
+
+# KV namespace for storing query history (Layer 2)
+# Create via: wrangler kv namespace create BRAIN_MEMORY
+# Then paste the returned id below.
+[[kv_namespaces]]
+binding = "BRAIN_MEMORY"
+id = "a87d508be6444828883990e3641ea06d"
+
+# Secrets — set via `wrangler secret put SECRET_NAME` after deploy:
+#   ANTHROPIC_API_KEY    Anthropic API key
+#   GITHUB_TOKEN         Fine-scoped PAT, repo read access only
+#   GOOGLE_CLIENT_ID     OAuth client for Workspace SSO
+#   GOOGLE_CLIENT_SECRET OAuth client secret
+#   SESSION_SECRET       Random 32-byte string for signing session cookies
+
+[vars]
+GITHUB_REPO = "Campaign-OS/wardforge-web"
+ALLOWED_DOMAIN = "ward-forge.com"
+FRONTEND_ORIGIN = "https://brain.ward-forge.com"

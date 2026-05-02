@@ -12,30 +12,59 @@ const fmtDate = (s: string | null): string => {
   return s;
 };
 
-const fmtRelativeTime = (ts: number): string => {
-  const diff = Date.now() - ts;
-  const mins = Math.floor(diff / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
-};
-
 const STATUS_COLORS: Record<CommitmentStatus, string> = {
-  open: "bg-stone-700 text-stone-200",
-  "in-progress": "bg-blue-900 text-blue-200",
-  blocked: "bg-amber-900 text-amber-200",
-  done: "bg-emerald-900 text-emerald-200",
-  dropped: "bg-stone-800 text-stone-500",
+  open: "bg-stone-700 text-stone-100",
+  "in-progress": "bg-blue-900 text-blue-100",
+  blocked: "bg-amber-900 text-amber-100",
+  done: "bg-emerald-900 text-emerald-100",
+  dropped: "bg-stone-800 text-stone-400",
 };
 
-const KANBAN_COLUMNS: Array<{ key: CommitmentHorizon | "done"; label: string }> = [
-  { key: "today", label: "Today" },
-  { key: "this-week", label: "This Week" },
-  { key: "later", label: "Later" },
-  { key: "done", label: "Done" },
+// Each kanban column gets its own visual identity: header bar color,
+// background tint, accent color. Helps the eye land in the right place
+// without reading the column label every time.
+interface ColumnTheme {
+  key: CommitmentHorizon | "done";
+  label: string;
+  headerClass: string; // colored header bar
+  bgClass: string; // column body background
+  borderClass: string; // column border
+  accentClass: string; // count badge
+}
+
+const KANBAN_COLUMNS: ColumnTheme[] = [
+  {
+    key: "today",
+    label: "TODAY",
+    headerClass: "bg-rose-600 text-rose-50",
+    bgClass: "bg-rose-950/30",
+    borderClass: "border-rose-900/60",
+    accentClass: "bg-rose-900 text-rose-100",
+  },
+  {
+    key: "this-week",
+    label: "THIS WEEK",
+    headerClass: "bg-amber-600 text-amber-50",
+    bgClass: "bg-amber-950/20",
+    borderClass: "border-amber-900/60",
+    accentClass: "bg-amber-900 text-amber-100",
+  },
+  {
+    key: "later",
+    label: "LATER",
+    headerClass: "bg-sky-700 text-sky-50",
+    bgClass: "bg-sky-950/20",
+    borderClass: "border-sky-900/60",
+    accentClass: "bg-sky-900 text-sky-100",
+  },
+  {
+    key: "done",
+    label: "DONE",
+    headerClass: "bg-emerald-700 text-emerald-50",
+    bgClass: "bg-emerald-950/20",
+    borderClass: "border-emerald-900/60",
+    accentClass: "bg-emerald-900 text-emerald-100",
+  },
 ];
 
 interface Props {
@@ -78,14 +107,14 @@ export default function Dashboard({ onOpenChat }: Props) {
 
   if (loading && !data) {
     return (
-      <div className="min-h-screen flex items-center justify-center text-stone-500 text-sm">
+      <div className="min-h-screen flex items-center justify-center text-stone-500 text-base">
         Loading dashboard…
       </div>
     );
   }
   if (error && !data) {
     return (
-      <div className="min-h-screen flex items-center justify-center text-amber-400 text-sm">
+      <div className="min-h-screen flex items-center justify-center text-amber-400 text-base">
         {error}
       </div>
     );
@@ -108,13 +137,11 @@ export default function Dashboard({ onOpenChat }: Props) {
     if (c.status === "done") {
       grouped.done.push(c);
     } else if (c.status === "dropped") {
-      // Dropped items stay in the file but don't show on the board
       continue;
     } else {
       grouped[c.horizon].push(c);
     }
   }
-  // Sort: deadline ascending (no deadline last), then created descending
   const sortFn = (a: Commitment, b: Commitment): number => {
     if (a.deadline && b.deadline) return a.deadline.localeCompare(b.deadline);
     if (a.deadline && !b.deadline) return -1;
@@ -174,20 +201,20 @@ export default function Dashboard({ onOpenChat }: Props) {
   const today = new Date().toISOString().slice(0, 10);
 
   return (
-    <div className="min-h-screen p-6 space-y-6">
+    <div className="min-h-screen p-6 space-y-6 text-base">
       {/* Header */}
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
-          <h1 className="text-2xl font-semibold">Dashboard</h1>
-          <div className="text-xs text-stone-500 mt-1">
+          <h1 className="text-3xl font-semibold">Dashboard</h1>
+          <div className="text-sm text-stone-500 mt-1">
             {data.signed_in_as.name} · {data.signed_in_as.email} · {today}
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <div className="flex border border-stone-800 rounded overflow-hidden text-sm">
+          <div className="flex border border-stone-800 rounded overflow-hidden text-base">
             <button
               onClick={() => setView("personal")}
-              className={`px-3 py-1.5 ${
+              className={`px-4 py-2 ${
                 view === "personal"
                   ? "bg-stone-100 text-stone-950"
                   : "text-stone-400 hover:bg-stone-900"
@@ -197,7 +224,7 @@ export default function Dashboard({ onOpenChat }: Props) {
             </button>
             <button
               onClick={() => setView("company")}
-              className={`px-3 py-1.5 ${
+              className={`px-4 py-2 ${
                 view === "company"
                   ? "bg-stone-100 text-stone-950"
                   : "text-stone-400 hover:bg-stone-900"
@@ -208,13 +235,13 @@ export default function Dashboard({ onOpenChat }: Props) {
           </div>
           <button
             onClick={() => setShowNewModal(true)}
-            className="px-3 py-1.5 bg-stone-900 hover:bg-stone-800 border border-stone-700 rounded text-sm"
+            className="px-4 py-2 bg-stone-900 hover:bg-stone-800 border border-stone-700 rounded text-base"
           >
             + New commitment
           </button>
           <button
             onClick={onOpenChat}
-            className="px-3 py-1.5 bg-stone-900 hover:bg-stone-800 border border-stone-700 rounded text-sm"
+            className="px-4 py-2 bg-stone-900 hover:bg-stone-800 border border-stone-700 rounded text-base"
           >
             Chat ↗
           </button>
@@ -249,23 +276,28 @@ export default function Dashboard({ onOpenChat }: Props) {
       </div>
 
       {/* Kanban */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         {KANBAN_COLUMNS.map((col) => (
           <div
             key={col.key}
-            className="bg-stone-950 border border-stone-800 rounded-lg p-3 min-h-[200px]"
+            className={`border rounded-lg overflow-hidden flex flex-col ${col.borderClass} ${col.bgClass}`}
           >
-            <div className="flex items-center justify-between mb-3">
-              <div className="text-xs uppercase tracking-wide text-stone-500 font-medium">
-                {col.label}
-              </div>
-              <div className="text-xs text-stone-600">
+            {/* Colored header bar — strong visual anchor per column */}
+            <div
+              className={`${col.headerClass} px-4 py-2.5 flex items-center justify-between font-semibold tracking-wide`}
+            >
+              <span className="text-base">{col.label}</span>
+              <span
+                className={`${col.accentClass} text-sm rounded-full px-2.5 py-0.5 font-medium tabular-nums`}
+              >
                 {grouped[col.key].length}
-              </div>
+              </span>
             </div>
-            <div className="space-y-2">
+            <div className="p-3 space-y-2.5 min-h-[180px] flex-1">
               {grouped[col.key].length === 0 && (
-                <div className="text-xs text-stone-700 italic">empty</div>
+                <div className="text-sm text-stone-700 italic px-1 py-2">
+                  empty
+                </div>
               )}
               {grouped[col.key].map((c) => (
                 <CommitmentCard
@@ -296,42 +328,10 @@ export default function Dashboard({ onOpenChat }: Props) {
         ))}
       </div>
 
-      {/* Bottom panels */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-        <Panel title="Recent commits (7d)">
-          {data.recent_commits.length === 0 ? (
-            <div className="text-xs text-stone-600 italic">none</div>
-          ) : (
-            <div className="space-y-1.5 text-xs text-stone-300 font-mono">
-              {data.recent_commits.slice(0, 12).map((line, i) => (
-                <div key={i} className="truncate">
-                  {line}
-                </div>
-              ))}
-            </div>
-          )}
-        </Panel>
-
-        <Panel title="Recent brain threads">
-          {data.recent_threads.length === 0 ? (
-            <div className="text-xs text-stone-600 italic">none</div>
-          ) : (
-            <div className="space-y-2">
-              {data.recent_threads.map((t) => (
-                <div key={t.id} className="text-xs">
-                  <div className="text-stone-300 line-clamp-2">{t.title}</div>
-                  <div className="text-stone-600 mt-0.5">
-                    {t.created_by_name.split(" ")[0]} ·{" "}
-                    {fmtRelativeTime(t.updated_at)}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </Panel>
-
+      {/* Bottom panels — inbox + state preview, side by side */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <Panel title={`Inbox (${data.inbox_preview.today_count} today)`}>
-          <pre className="text-xs text-stone-400 whitespace-pre-wrap font-mono leading-relaxed">
+          <pre className="text-sm text-stone-300 whitespace-pre-wrap font-mono leading-relaxed">
             {data.inbox_preview.raw_excerpt || "(empty)"}
           </pre>
         </Panel>
@@ -342,9 +342,8 @@ export default function Dashboard({ onOpenChat }: Props) {
               ? ` — ${data.weekly_state_preview.most_recent_path.split("/").pop()}`
               : ""
           }`}
-          colSpan={2}
         >
-          <pre className="text-xs text-stone-400 whitespace-pre-wrap leading-relaxed">
+          <pre className="text-sm text-stone-300 whitespace-pre-wrap leading-relaxed">
             {data.weekly_state_preview.most_recent_excerpt}
           </pre>
         </Panel>
@@ -353,14 +352,14 @@ export default function Dashboard({ onOpenChat }: Props) {
       {/* Confirm modal */}
       {pendingChange && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50">
-          <div className="bg-stone-950 border border-amber-700 rounded-lg p-5 max-w-md w-full">
-            <div className="text-xs uppercase tracking-wide text-amber-400 mb-2">
+          <div className="bg-stone-950 border border-amber-700 rounded-lg p-6 max-w-md w-full">
+            <div className="text-sm uppercase tracking-wide text-amber-400 mb-2">
               Proposed change — review before committing
             </div>
-            <div className="text-sm text-stone-200 mb-4 break-words">
+            <div className="text-base text-stone-100 mb-4 break-words">
               {pendingChange.description}
             </div>
-            <div className="text-xs text-stone-500 mb-4">
+            <div className="text-sm text-stone-500 mb-4">
               Will commit to{" "}
               <span className="font-mono">docs/state/commitments.md</span> in
               the substrate repo.
@@ -368,13 +367,13 @@ export default function Dashboard({ onOpenChat }: Props) {
             <div className="flex gap-2">
               <button
                 onClick={confirmChange}
-                className="px-3 py-1.5 bg-amber-500 text-stone-950 rounded text-sm font-medium"
+                className="px-4 py-2 bg-amber-500 text-stone-950 rounded text-base font-medium"
               >
                 Confirm and commit
               </button>
               <button
                 onClick={() => setPendingChange(null)}
-                className="px-3 py-1.5 text-stone-400 text-sm hover:text-stone-200"
+                className="px-4 py-2 text-stone-400 text-base hover:text-stone-200"
               >
                 Cancel
               </button>
@@ -386,38 +385,38 @@ export default function Dashboard({ onOpenChat }: Props) {
       {/* New commitment modal */}
       {showNewModal && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50">
-          <div className="bg-stone-950 border border-stone-700 rounded-lg p-5 max-w-md w-full space-y-3">
-            <div className="text-sm font-medium text-stone-200">
+          <div className="bg-stone-950 border border-stone-700 rounded-lg p-6 max-w-md w-full space-y-4">
+            <div className="text-base font-medium text-stone-100">
               New commitment
             </div>
             <div>
-              <label className="text-xs text-stone-500">Title</label>
+              <label className="text-sm text-stone-500">Title</label>
               <input
                 value={newDraft.title || ""}
                 onChange={(e) =>
                   setNewDraft({ ...newDraft, title: e.target.value })
                 }
-                className="w-full bg-stone-900 border border-stone-700 rounded px-2 py-1.5 text-sm mt-1"
+                className="w-full bg-stone-900 border border-stone-700 rounded px-3 py-2 text-base mt-1"
                 placeholder="e.g. Talk to Matthew about May 31 milestone"
                 autoFocus
               />
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="text-xs text-stone-500">Owner</label>
+                <label className="text-sm text-stone-500">Owner</label>
                 <select
                   value={newDraft.owner || ownerKey}
                   onChange={(e) =>
                     setNewDraft({ ...newDraft, owner: e.target.value })
                   }
-                  className="w-full bg-stone-900 border border-stone-700 rounded px-2 py-1.5 text-sm mt-1"
+                  className="w-full bg-stone-900 border border-stone-700 rounded px-3 py-2 text-base mt-1"
                 >
                   <option value="troy">troy</option>
                   <option value="matthew">matthew</option>
                 </select>
               </div>
               <div>
-                <label className="text-xs text-stone-500">Horizon</label>
+                <label className="text-sm text-stone-500">Horizon</label>
                 <select
                   value={newDraft.horizon || "today"}
                   onChange={(e) =>
@@ -426,7 +425,7 @@ export default function Dashboard({ onOpenChat }: Props) {
                       horizon: e.target.value as CommitmentHorizon,
                     })
                   }
-                  className="w-full bg-stone-900 border border-stone-700 rounded px-2 py-1.5 text-sm mt-1"
+                  className="w-full bg-stone-900 border border-stone-700 rounded px-3 py-2 text-base mt-1"
                 >
                   <option value="today">Today</option>
                   <option value="this-week">This Week</option>
@@ -435,7 +434,7 @@ export default function Dashboard({ onOpenChat }: Props) {
               </div>
             </div>
             <div>
-              <label className="text-xs text-stone-500">Deadline (optional)</label>
+              <label className="text-sm text-stone-500">Deadline (optional)</label>
               <input
                 type="date"
                 value={newDraft.deadline || ""}
@@ -445,31 +444,31 @@ export default function Dashboard({ onOpenChat }: Props) {
                     deadline: e.target.value || null,
                   })
                 }
-                className="w-full bg-stone-900 border border-stone-700 rounded px-2 py-1.5 text-sm mt-1"
+                className="w-full bg-stone-900 border border-stone-700 rounded px-3 py-2 text-base mt-1"
               />
             </div>
             <div>
-              <label className="text-xs text-stone-500">Notes (optional)</label>
+              <label className="text-sm text-stone-500">Notes (optional)</label>
               <textarea
                 value={newDraft.notes || ""}
                 onChange={(e) =>
                   setNewDraft({ ...newDraft, notes: e.target.value })
                 }
-                className="w-full bg-stone-900 border border-stone-700 rounded px-2 py-1.5 text-sm mt-1"
-                rows={2}
+                className="w-full bg-stone-900 border border-stone-700 rounded px-3 py-2 text-base mt-1"
+                rows={3}
               />
             </div>
             <div className="flex gap-2 pt-2">
               <button
                 onClick={proposeNew}
                 disabled={!newDraft.title?.trim()}
-                className="px-3 py-1.5 bg-stone-100 text-stone-950 rounded text-sm font-medium disabled:opacity-50"
+                className="px-4 py-2 bg-stone-100 text-stone-950 rounded text-base font-medium disabled:opacity-50"
               >
                 Propose
               </button>
               <button
                 onClick={() => setShowNewModal(false)}
-                className="px-3 py-1.5 text-stone-400 text-sm hover:text-stone-200"
+                className="px-4 py-2 text-stone-400 text-base hover:text-stone-200"
               >
                 Cancel
               </button>
@@ -495,11 +494,11 @@ function MetricCard({ label, value, highlight }: MetricCardProps) {
         ? "border-amber-700/60"
         : "border-stone-800";
   return (
-    <div className={`bg-stone-950 border ${colorClass} rounded-lg p-3`}>
-      <div className="text-xs uppercase tracking-wide text-stone-500">
+    <div className={`bg-stone-950 border ${colorClass} rounded-lg p-4`}>
+      <div className="text-sm uppercase tracking-wide text-stone-500">
         {label}
       </div>
-      <div className="text-2xl font-semibold mt-1 tabular-nums">{value}</div>
+      <div className="text-3xl font-semibold mt-1 tabular-nums">{value}</div>
     </div>
   );
 }
@@ -526,12 +525,14 @@ function CommitmentCard({
     c.status !== "dropped";
   return (
     <div
-      className={`bg-stone-900 border rounded p-2.5 text-xs ${
-        slipping ? "border-red-800" : "border-stone-800"
+      className={`bg-stone-900/90 border rounded-md p-3 ${
+        slipping ? "border-red-700" : "border-stone-700"
       }`}
     >
-      <div className="text-stone-200 font-medium leading-snug">{c.title}</div>
-      <div className="flex items-center justify-between mt-2 gap-2 text-[10px] text-stone-500">
+      <div className="text-base text-stone-100 font-medium leading-snug">
+        {c.title}
+      </div>
+      <div className="flex items-center justify-between mt-2 gap-2 text-xs text-stone-400">
         {view === "company" && (
           <span className="capitalize">{c.owner}</span>
         )}
@@ -545,11 +546,11 @@ function CommitmentCard({
           )}
         </span>
       </div>
-      <div className="flex items-center gap-1 mt-2 flex-wrap">
+      <div className="flex items-center gap-1.5 mt-2.5 flex-wrap">
         <select
           value={c.status}
           onChange={(e) => onChangeStatus(e.target.value as CommitmentStatus)}
-          className={`text-[10px] px-1.5 py-0.5 rounded ${STATUS_COLORS[c.status]}`}
+          className={`text-xs px-2 py-1 rounded font-medium ${STATUS_COLORS[c.status]}`}
         >
           <option value="open">open</option>
           <option value="in-progress">in-progress</option>
@@ -563,7 +564,7 @@ function CommitmentCard({
             onChange={(e) =>
               onChangeHorizon(e.target.value as CommitmentHorizon)
             }
-            className="text-[10px] px-1.5 py-0.5 rounded bg-stone-800 text-stone-400"
+            className="text-xs px-2 py-1 rounded bg-stone-800 text-stone-300"
           >
             <option value="today">today</option>
             <option value="this-week">this week</option>
@@ -572,7 +573,7 @@ function CommitmentCard({
         )}
       </div>
       {c.notes && (
-        <div className="text-[10px] text-stone-500 mt-2 leading-snug line-clamp-2">
+        <div className="text-xs text-stone-400 mt-2.5 leading-snug line-clamp-3">
           {c.notes}
         </div>
       )}
@@ -583,19 +584,15 @@ function CommitmentCard({
 interface PanelProps {
   title: string;
   children: React.ReactNode;
-  colSpan?: number;
 }
 
-function Panel({ title, children, colSpan }: PanelProps) {
-  const span = colSpan === 2 ? "lg:col-span-2" : "";
+function Panel({ title, children }: PanelProps) {
   return (
-    <div
-      className={`bg-stone-950 border border-stone-800 rounded-lg p-4 ${span}`}
-    >
-      <div className="text-xs uppercase tracking-wide text-stone-500 mb-3">
+    <div className="bg-stone-950 border border-stone-800 rounded-lg p-5">
+      <div className="text-sm uppercase tracking-wide text-stone-500 mb-3 font-medium">
         {title}
       </div>
-      <div className="max-h-64 overflow-y-auto">{children}</div>
+      <div className="max-h-80 overflow-y-auto">{children}</div>
     </div>
   );
 }

@@ -54,6 +54,45 @@ export interface ThreadTurn {
   ts: number;
 }
 
+export type CommitmentStatus = "open" | "in-progress" | "blocked" | "done" | "dropped";
+export type CommitmentHorizon = "today" | "this-week" | "later";
+
+export interface Commitment {
+  id: string;
+  owner: string;
+  title: string;
+  created: string;
+  deadline: string | null;
+  horizon: CommitmentHorizon;
+  status: CommitmentStatus;
+  source: string;
+  completed: string | null;
+  notes: string;
+}
+
+export interface DashboardData {
+  signed_in_as: { email: string; name: string; owner_key: string };
+  commitments: Commitment[];
+  metrics: {
+    open_count: number;
+    in_progress_count: number;
+    blocked_count: number;
+    done_this_week: number;
+    slipping_count: number;
+    commits_past_7_days: number;
+    days_since_last_state_file: number | null;
+  };
+  recent_commits: string[];
+  recent_threads: Array<{
+    id: string;
+    title: string;
+    created_by_name: string;
+    updated_at: number;
+  }>;
+  inbox_preview: { today_count: number; raw_excerpt: string };
+  weekly_state_preview: { most_recent_path: string | null; most_recent_excerpt: string };
+}
+
 export const api = {
   loginUrl: () => `${API_BASE}/session/login`,
   me: () => req<{ user: User }>("/session/me"),
@@ -75,6 +114,27 @@ export const api = {
       req<{ threads: ThreadSummary[] }>(`/api/threads?limit=${limit}`),
     get: (id: string) =>
       req<{ thread: ThreadSummary; turns: ThreadTurn[] }>(`/api/threads/${id}`),
+  },
+
+  dashboard: () => req<DashboardData>("/api/dashboard"),
+
+  commitments: {
+    list: () =>
+      req<{ commitments: Commitment[]; signed_in_as: string }>("/api/commitments"),
+    propose: (
+      payload:
+        | { new_commitment: Partial<Commitment> }
+        | { change: { id: string; field: keyof Commitment; new_value: string | null } }
+    ) =>
+      req<{ token: string; kind: "create" | "update"; preview: unknown; expires_in: number }>(
+        "/api/commitments/propose",
+        { method: "POST", body: JSON.stringify(payload) }
+      ),
+    confirm: (token: string) =>
+      req<{ ok: boolean; commit_sha: string; commit_url: string }>(
+        "/api/commitments/confirm",
+        { method: "POST", body: JSON.stringify({ token }) }
+      ),
   },
 
   proposeInbox: (intent: string) =>

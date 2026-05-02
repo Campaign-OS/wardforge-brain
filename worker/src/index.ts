@@ -7,22 +7,28 @@
  *   GET  /session/callback                 — OAuth callback, sets session cookie
  *   GET  /session/me                       — return current user or 401
  *   POST /session/logout                   — clear session
+ *
  *   POST /api/query                        — ask the brain (creates or continues thread)
  *   GET  /api/threads?limit=N              — list recent threads
  *   GET  /api/threads/:id                  — fetch a thread with all turns
+ *
+ *   GET  /api/dashboard                    — aggregated dashboard data (commitments, metrics, activity)
+ *   GET  /api/commitments                  — raw commitments list
+ *   POST /api/commitments/propose          — propose a new commitment or change
+ *   POST /api/commitments/confirm          — confirm a pending proposal (commits to repo)
+ *
  *   POST /api/actions/inbox                — Layer 3: propose adding to inbox
  *   POST /api/actions/inbox/confirm        — Layer 3: confirm and execute
- *
- * Every /api/* and /session/me route requires a valid session for an
- * @ward-forge.com email.
- *
- * NOTE: Routes use /session/* (not /auth/*) because Cloudflare's Free-tier
- * edge protections silently block /auth/* paths for browser-class clients.
- * See docs/deployment.md → "Cloudflare path-block gotcha".
  */
 
 import { handleQuery, handleListThreads, handleGetThread } from "./brain";
 import { handleInboxPropose, handleInboxConfirm } from "./actions";
+import { handleDashboard } from "./dashboard";
+import {
+  handleListCommitments,
+  handleCommitmentPropose,
+  handleCommitmentConfirm,
+} from "./commitments";
 import {
   handleLoginStart,
   handleLoginCallback,
@@ -63,7 +69,6 @@ export default {
     const url = new URL(request.url);
     const origin = env.FRONTEND_ORIGIN;
 
-    // CORS preflight
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: cors(origin) });
     }
@@ -94,6 +99,8 @@ export default {
       if (url.pathname === "/session/logout") {
         return handleLogout(cors(origin));
       }
+
+      // Brain (chat)
       if (url.pathname === "/api/query" && request.method === "POST") {
         return handleQuery(request, ctx, cors(origin));
       }
@@ -104,6 +111,24 @@ export default {
       if (threadMatch && request.method === "GET") {
         return handleGetThread(threadMatch[1], ctx, cors(origin));
       }
+
+      // Dashboard
+      if (url.pathname === "/api/dashboard" && request.method === "GET") {
+        return handleDashboard(request, ctx, cors(origin));
+      }
+
+      // Commitments
+      if (url.pathname === "/api/commitments" && request.method === "GET") {
+        return handleListCommitments(request, ctx, cors(origin));
+      }
+      if (url.pathname === "/api/commitments/propose" && request.method === "POST") {
+        return handleCommitmentPropose(request, ctx, cors(origin));
+      }
+      if (url.pathname === "/api/commitments/confirm" && request.method === "POST") {
+        return handleCommitmentConfirm(request, ctx, cors(origin));
+      }
+
+      // Inbox actions
       if (url.pathname === "/api/actions/inbox" && request.method === "POST") {
         return handleInboxPropose(request, ctx, cors(origin));
       }

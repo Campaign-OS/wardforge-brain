@@ -2,6 +2,7 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api, type User, type ThreadSummary } from "./api";
+import Dashboard from "./Dashboard";
 
 interface Message {
   role: "user" | "assistant" | "system";
@@ -23,9 +24,19 @@ const fmtTime = (ts: number): string =>
     minute: "2-digit",
   });
 
+type View = "dashboard" | "chat";
+
+const initialView = (): View => {
+  if (typeof window === "undefined") return "dashboard";
+  return window.location.pathname === "/chat" ? "chat" : "dashboard";
+};
+
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
+  const [view, setView] = useState<View>(initialView());
+
+  // Chat state
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -44,19 +55,37 @@ export default function App() {
     });
   }, []);
 
+  // Update browser URL when view changes (lightweight, no router)
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const path = view === "chat" ? "/chat" : "/";
+    if (window.location.pathname !== path) {
+      window.history.replaceState({}, "", path);
+    }
+  }, [view]);
+
+  // Browser back/forward support
+  useEffect(() => {
+    const onPop = () => setView(initialView());
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
   const refreshThreads = useCallback(async () => {
     const r = await api.threads.list(30);
     if (r.ok) setThreads(r.data.threads);
   }, []);
 
   useEffect(() => {
-    if (user) refreshThreads();
-  }, [user, refreshThreads]);
+    if (user && view === "chat") refreshThreads();
+  }, [user, view, refreshThreads]);
 
-  // Scroll to bottom on new message (but not on thread-switch loads)
   useEffect(() => {
     if (loadingThread) return;
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+    scrollRef.current?.scrollTo({
+      top: scrollRef.current.scrollHeight,
+      behavior: "smooth",
+    });
   }, [messages, loadingThread]);
 
   const startNewThread = () => {
@@ -82,7 +111,6 @@ export default function App() {
       setProposal(null);
     }
     setLoadingThread(false);
-    // Jump scroll to bottom on thread load
     setTimeout(() => {
       scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
     }, 50);
@@ -92,7 +120,10 @@ export default function App() {
     if (!input.trim() || loading) return;
     const question = input.trim();
     setInput("");
-    setMessages((prev) => [...prev, { role: "user", content: question, ts: Date.now() }]);
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", content: question, ts: Date.now() },
+    ]);
     setLoading(true);
 
     const r = await api.query(question, currentThreadId ?? undefined);
@@ -102,7 +133,6 @@ export default function App() {
         ...prev,
         { role: "assistant", content: r.data.answer, ts: Date.now() },
       ]);
-      // Server is the source of truth for thread_id — first turn creates it.
       setCurrentThreadId(r.data.thread_id);
       refreshThreads();
     } else {
@@ -146,13 +176,21 @@ export default function App() {
     } else {
       setMessages((prev) => [
         ...prev,
-        { role: "system", content: `Inbox add failed: ${r.error}`, ts: Date.now() },
+        {
+          role: "system",
+          content: `Inbox add failed: ${r.error}`,
+          ts: Date.now(),
+        },
       ]);
     }
   };
 
   if (!authChecked) {
-    return <div className="min-h-screen flex items-center justify-center text-stone-400">…</div>;
+    return (
+      <div className="min-h-screen flex items-center justify-center text-stone-400">
+        …
+      </div>
+    );
   }
 
   if (!user) {
@@ -170,189 +208,240 @@ export default function App() {
         >
           Sign in with Google
         </a>
-        <p className="text-xs text-stone-500">Restricted to @ward-forge.com accounts.</p>
+        <p className="text-xs text-stone-500">
+          Restricted to @ward-forge.com accounts.
+        </p>
       </div>
     );
   }
 
-  return (
-    <div className="min-h-screen flex">
-      {/* Sidebar */}
-      <aside className="w-72 border-r border-stone-800 flex flex-col">
-        <div className="p-4 border-b border-stone-800">
-          <h1 className="font-semibold">WardForge Brain</h1>
-          <div className="text-xs text-stone-500 mt-1">{user.email}</div>
-        </div>
-        <div className="p-3 border-b border-stone-800">
-          <button
-            onClick={startNewThread}
-            className="w-full px-3 py-2 bg-stone-900 hover:bg-stone-800 border border-stone-700 rounded text-sm text-stone-200 transition"
-          >
-            + New thread
-          </button>
-        </div>
-        <div className="flex-1 overflow-y-auto p-3">
-          <div className="text-xs uppercase tracking-wide text-stone-500 mb-2 px-1">
-            Recent threads
-          </div>
-          {threads.length === 0 && (
-            <div className="text-xs text-stone-600 px-1">No threads yet.</div>
-          )}
-          {threads.map((t) => (
-            <button
-              key={t.id}
-              onClick={() => loadThread(t.id)}
-              className={`block w-full text-left text-xs p-2 rounded mb-1 transition ${
-                currentThreadId === t.id
-                  ? "bg-stone-800 text-stone-100"
-                  : "text-stone-300 hover:bg-stone-900"
-              }`}
-            >
-              <div className="line-clamp-2 leading-snug">{t.title}</div>
-              <div className="text-stone-600 text-[10px] mt-1">
-                {t.created_by.name.split(" ")[0]} · {fmtTime(t.updated_at)}
-              </div>
-            </button>
-          ))}
-        </div>
-        <div className="p-4 border-t border-stone-800">
-          <button
-            onClick={() => api.logout().then(() => setUser(null))}
-            className="text-xs text-stone-500 hover:text-stone-300"
-          >
-            Sign out
-          </button>
-        </div>
-      </aside>
+  // Top nav present in both views
+  const TopNav = () => (
+    <div className="border-b border-stone-800 px-4 py-2 flex items-center justify-between">
+      <div className="flex items-center gap-1">
+        <button
+          onClick={() => setView("dashboard")}
+          className={`px-3 py-1.5 text-sm rounded ${
+            view === "dashboard"
+              ? "bg-stone-800 text-stone-100"
+              : "text-stone-400 hover:bg-stone-900"
+          }`}
+        >
+          Dashboard
+        </button>
+        <button
+          onClick={() => setView("chat")}
+          className={`px-3 py-1.5 text-sm rounded ${
+            view === "chat"
+              ? "bg-stone-800 text-stone-100"
+              : "text-stone-400 hover:bg-stone-900"
+          }`}
+        >
+          Chat
+        </button>
+      </div>
+      <div className="flex items-center gap-3">
+        <span className="text-xs text-stone-500">{user.email}</span>
+        <button
+          onClick={() => api.logout().then(() => setUser(null))}
+          className="text-xs text-stone-500 hover:text-stone-300"
+        >
+          Sign out
+        </button>
+      </div>
+    </div>
+  );
 
-      {/* Main */}
-      <main className="flex-1 flex flex-col h-screen">
-        <div ref={scrollRef} className="flex-1 overflow-y-auto p-6 space-y-6">
-          {messages.length === 0 && !loadingThread && (
-            <div className="max-w-2xl mx-auto pt-12 text-stone-500 text-sm">
-              <p className="mb-3">Ask anything about WardForge. The brain reads:</p>
-              <ul className="list-disc list-inside space-y-1 text-stone-600">
-                <li>architecture, build plan, features</li>
-                <li>recent ADRs and weekly states</li>
-                <li>commits from the past 14 days</li>
-                <li>code in src/, worker/, frontend/, lib/, tests/</li>
-                <li>recent threads from across the team</li>
-              </ul>
-              <p className="mt-4 text-stone-600">
-                Conversations are threaded — follow-ups stay in context. Use{" "}
-                <em>+ New thread</em> to start fresh.
-              </p>
+  if (view === "dashboard") {
+    return (
+      <div>
+        <TopNav />
+        <Dashboard onOpenChat={() => setView("chat")} />
+      </div>
+    );
+  }
+
+  // Chat view
+  return (
+    <div className="flex flex-col h-screen">
+      <TopNav />
+      <div className="flex-1 flex overflow-hidden">
+        {/* Sidebar */}
+        <aside className="w-72 border-r border-stone-800 flex flex-col">
+          <div className="p-3 border-b border-stone-800">
+            <button
+              onClick={startNewThread}
+              className="w-full px-3 py-2 bg-stone-900 hover:bg-stone-800 border border-stone-700 rounded text-sm text-stone-200 transition"
+            >
+              + New thread
+            </button>
+          </div>
+          <div className="flex-1 overflow-y-auto p-3">
+            <div className="text-xs uppercase tracking-wide text-stone-500 mb-2 px-1">
+              Recent threads
             </div>
-          )}
-          {loadingThread && (
-            <div className="max-w-3xl mx-auto text-stone-500 text-sm italic">
-              Loading thread…
-            </div>
-          )}
-          {messages.map((m, i) => (
-            <div key={i} className="max-w-3xl mx-auto">
-              <div className="text-xs text-stone-500 mb-1">
-                {m.role === "user" ? user.name : m.role === "assistant" ? "Brain" : "System"} ·{" "}
-                {fmtTime(m.ts)}
-              </div>
-              <div
-                className={
-                  m.role === "user"
-                    ? "bg-stone-900 rounded-lg p-4 prose-brain"
-                    : m.role === "assistant"
-                      ? "bg-stone-950 border border-stone-800 rounded-lg p-4 prose-brain"
-                      : "text-stone-500 italic text-sm"
-                }
+            {threads.length === 0 && (
+              <div className="text-xs text-stone-600 px-1">No threads yet.</div>
+            )}
+            {threads.map((t) => (
+              <button
+                key={t.id}
+                onClick={() => loadThread(t.id)}
+                className={`block w-full text-left text-xs p-2 rounded mb-1 transition ${
+                  currentThreadId === t.id
+                    ? "bg-stone-800 text-stone-100"
+                    : "text-stone-300 hover:bg-stone-900"
+                }`}
               >
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
+                <div className="line-clamp-2 leading-snug">{t.title}</div>
+                <div className="text-stone-600 text-[10px] mt-1">
+                  {t.created_by.name.split(" ")[0]} · {fmtTime(t.updated_at)}
+                </div>
+              </button>
+            ))}
+          </div>
+        </aside>
+
+        {/* Main chat area */}
+        <main className="flex-1 flex flex-col">
+          <div ref={scrollRef} className="flex-1 overflow-y-auto p-6 space-y-6">
+            {messages.length === 0 && !loadingThread && (
+              <div className="max-w-2xl mx-auto pt-12 text-stone-500 text-sm">
+                <p className="mb-3">
+                  Ask anything about WardForge. The brain reads:
+                </p>
+                <ul className="list-disc list-inside space-y-1 text-stone-600">
+                  <li>architecture, build plan, features</li>
+                  <li>recent ADRs and weekly states</li>
+                  <li>commits from the past 14 days</li>
+                  <li>code in src/, worker/, frontend/, lib/, tests/</li>
+                  <li>commitments + recent threads from across the team</li>
+                </ul>
+                <p className="mt-4 text-stone-600">
+                  Conversations are threaded — follow-ups stay in context. Use{" "}
+                  <em>+ New thread</em> to start fresh.
+                </p>
               </div>
-              {m.role === "assistant" && (
-                <div className="mt-2 flex gap-2 text-xs">
+            )}
+            {loadingThread && (
+              <div className="max-w-3xl mx-auto text-stone-500 text-sm italic">
+                Loading thread…
+              </div>
+            )}
+            {messages.map((m, i) => (
+              <div key={i} className="max-w-3xl mx-auto">
+                <div className="text-xs text-stone-500 mb-1">
+                  {m.role === "user"
+                    ? user.name
+                    : m.role === "assistant"
+                      ? "Brain"
+                      : "System"}{" "}
+                  · {fmtTime(m.ts)}
+                </div>
+                <div
+                  className={
+                    m.role === "user"
+                      ? "bg-stone-900 rounded-lg p-4 prose-brain"
+                      : m.role === "assistant"
+                        ? "bg-stone-950 border border-stone-800 rounded-lg p-4 prose-brain"
+                        : "text-stone-500 italic text-sm"
+                  }
+                >
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {m.content}
+                  </ReactMarkdown>
+                </div>
+                {m.role === "assistant" && (
+                  <div className="mt-2 flex gap-2 text-xs">
+                    <button
+                      onClick={() =>
+                        proposeAdd(
+                          `From brain on ${new Date(m.ts).toLocaleDateString()}: ${
+                            messages[i - 1]?.content?.slice(0, 80) ||
+                            "follow up"
+                          }`
+                        )
+                      }
+                      className="text-stone-500 hover:text-stone-300"
+                    >
+                      + add to inbox
+                    </button>
+                  </div>
+                )}
+              </div>
+            ))}
+            {loading && (
+              <div className="max-w-3xl mx-auto text-stone-500 text-sm italic">
+                Thinking…
+              </div>
+            )}
+          </div>
+
+          {proposal && (
+            <div className="border-t border-amber-700 bg-amber-950/30 p-4">
+              <div className="max-w-3xl mx-auto">
+                <div className="text-xs uppercase tracking-wide text-amber-400 mb-2">
+                  Proposed inbox addition — review before confirming
+                </div>
+                <textarea
+                  value={proposalEdit}
+                  onChange={(e) => setProposalEdit(e.target.value)}
+                  className="w-full bg-stone-900 border border-stone-700 rounded p-2 text-sm"
+                  rows={2}
+                />
+                <div className="flex gap-2 mt-2">
                   <button
-                    onClick={() =>
-                      proposeAdd(
-                        `From brain on ${new Date(m.ts).toLocaleDateString()}: ${
-                          messages[i - 1]?.content?.slice(0, 80) || "follow up"
-                        }`
-                      )
-                    }
-                    className="text-stone-500 hover:text-stone-300"
+                    onClick={confirmProposal}
+                    className="px-3 py-1.5 bg-amber-500 text-stone-950 rounded text-sm font-medium"
                   >
-                    + add to inbox
+                    Confirm and commit
+                  </button>
+                  <button
+                    onClick={() => setProposal(null)}
+                    className="px-3 py-1.5 text-stone-400 text-sm hover:text-stone-200"
+                  >
+                    Cancel
                   </button>
                 </div>
-              )}
+              </div>
             </div>
-          ))}
-          {loading && (
-            <div className="max-w-3xl mx-auto text-stone-500 text-sm italic">Thinking…</div>
           )}
-        </div>
 
-        {/* Proposal modal */}
-        {proposal && (
-          <div className="border-t border-amber-700 bg-amber-950/30 p-4">
-            <div className="max-w-3xl mx-auto">
-              <div className="text-xs uppercase tracking-wide text-amber-400 mb-2">
-                Proposed inbox addition — review before confirming
-              </div>
+          <div className="border-t border-stone-800 p-4">
+            <div className="max-w-3xl mx-auto flex gap-2">
               <textarea
-                value={proposalEdit}
-                onChange={(e) => setProposalEdit(e.target.value)}
-                className="w-full bg-stone-900 border border-stone-700 rounded p-2 text-sm"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    submit();
+                  }
+                }}
+                placeholder={
+                  currentThreadId
+                    ? "Continue this thread…"
+                    : "Ask the brain anything…"
+                }
+                className="flex-1 bg-stone-900 border border-stone-800 rounded-md px-3 py-2 text-sm resize-none focus:outline-none focus:border-stone-600"
                 rows={2}
+                disabled={loading}
               />
-              <div className="flex gap-2 mt-2">
-                <button
-                  onClick={confirmProposal}
-                  className="px-3 py-1.5 bg-amber-500 text-stone-950 rounded text-sm font-medium"
-                >
-                  Confirm and commit
-                </button>
-                <button
-                  onClick={() => setProposal(null)}
-                  className="px-3 py-1.5 text-stone-400 text-sm hover:text-stone-200"
-                >
-                  Cancel
-                </button>
-              </div>
+              <button
+                onClick={submit}
+                disabled={loading || !input.trim()}
+                className="px-4 py-2 bg-stone-100 text-stone-950 rounded-md text-sm font-medium disabled:opacity-50"
+              >
+                {currentThreadId ? "Reply" : "Ask"}
+              </button>
+            </div>
+            <div className="max-w-3xl mx-auto text-xs text-stone-600 mt-2">
+              Enter to send · Shift+Enter for newline ·{" "}
+              {currentThreadId ? "thread context preserved" : "new thread"}
             </div>
           </div>
-        )}
-
-        {/* Input */}
-        <div className="border-t border-stone-800 p-4">
-          <div className="max-w-3xl mx-auto flex gap-2">
-            <textarea
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  submit();
-                }
-              }}
-              placeholder={
-                currentThreadId ? "Continue this thread…" : "Ask the brain anything…"
-              }
-              className="flex-1 bg-stone-900 border border-stone-800 rounded-md px-3 py-2 text-sm resize-none focus:outline-none focus:border-stone-600"
-              rows={2}
-              disabled={loading}
-            />
-            <button
-              onClick={submit}
-              disabled={loading || !input.trim()}
-              className="px-4 py-2 bg-stone-100 text-stone-950 rounded-md text-sm font-medium disabled:opacity-50"
-            >
-              {currentThreadId ? "Reply" : "Ask"}
-            </button>
-          </div>
-          <div className="max-w-3xl mx-auto text-xs text-stone-600 mt-2">
-            Enter to send · Shift+Enter for newline ·{" "}
-            {currentThreadId ? "thread context preserved" : "new thread"}
-          </div>
-        </div>
-      </main>
+        </main>
+      </div>
     </div>
   );
 }
